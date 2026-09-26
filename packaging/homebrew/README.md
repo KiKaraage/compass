@@ -4,8 +4,10 @@
 learned the hard way — keep them true when the install changes:
 
 - Depends order is load-bearing: `:build` deps first (alphabetical), then
-  normal deps (alphabetical), then `depends_on :linux` last. Anything else
-  fails `FormulaAudit/DependencyOrder`.
+  `depends_on :linux`, then normal deps (alphabetical). Anything else fails
+  `FormulaAudit/DependencyOrder` — note a `:linux` after the normal deps
+  reads naturally (ydotool does it with build-only deps) but fails audit
+  once normal deps exist.
 - The install must run `cargo install ... *std_cargo_args`;
   `FormulaAudit/Text` refuses `cargo build`. The multi-binary layout (helpers
   in `libexec/compass`, data under `share/compass`) is therefore spelled out

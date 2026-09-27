@@ -469,6 +469,11 @@ PY
         --method org.freedesktop.DBus.Properties.Get \
         org.freedesktop.Secret.Collection Locked 2>/dev/null
     }
+    secrets_up() {
+      as_user gdbus introspect --session \
+        --dest org.freedesktop.secrets \
+        --object-path /org/freedesktop/secrets 2>/dev/null | grep -q org.freedesktop.Secret.Service
+    }
     # --unlock creates a missing login keyring but cannot open one whose
     # password it does not know: autologin never unlocks it. A locked
     # collection answers Store with an interaction prompt that hangs
@@ -481,8 +486,25 @@ PY
         echo "could not recreate the login keyring" >&2
         exit 1
       fi
+      # The replacement daemon needs a moment to own the bus name, and the
+      # unlock above can race it, so wait for the service, then unlock the
+      # fresh daemon directly: it is idempotent when already unlocked.
+      if ! wait_for "the recreated daemon to answer" 60 secrets_up; then
+        echo "the Secret Service never came back after --replace" >&2
+        exit 1
+      fi
+      if ! printf compass-vmtest-keyring | timeout 60 bash -c 'as_user gnome-keyring-daemon --unlock --components=secrets'; then
+        echo "could not unlock the recreated login keyring" >&2
+        exit 1
+      fi
       if [ "$(login_locked)" != "(<false>,)" ]; then
-        echo "login keyring still locked after recreation: $(login_locked 2>&1 || true)" >&2
+        echo "login keyring still locked after recreation" >&2
+        as_user gdbus call --session \
+          --dest org.freedesktop.secrets \
+          --object-path /org/freedesktop/secrets \
+          --method org.freedesktop.DBus.Properties.Get \
+          org.freedesktop.Secret.Service Collections >&2 2>&1 || true
+        echo "Locked reads: '$(login_locked; true)'" >&2
         exit 1
       fi
     fi

@@ -428,20 +428,39 @@ PY
 
     # An unlocked login keyring, the way a password login leaves one: the
     # engine keeps history's master key there, and the Secret portal hands
-    # the Flatpak an empty secret when nothing is unlocked (the last run's
+    # the Flatpak an empty secret when nothing is unlocked (an earlier run's
     # "too short: 0"). Creates it with this password when none exists, the
     # way scripts/suite1/run.sh does; the keyring is the VM's throwaway.
     if ! as_user sh -c 'printf compass-vmtest-keyring | gnome-keyring-daemon --unlock --components=secrets >/dev/null'; then
       echo "could not unlock or create a login keyring" >&2
       exit 1
     fi
+    # Prove the Secret Service answers unlocked on the session bus before the
+    # engine waits on it: stdin is closed so a lock prompt fails instead of
+    # hanging the check.
+    if as_user command -v secret-tool >/dev/null; then
+      if ! as_user secret-tool store --label=compass-vmtest compass-vmtest probe </dev/null >/dev/null; then
+        echo "secret-tool store failed: the login keyring is not usable" >&2
+        exit 1
+      fi
+      if [ "$(as_user secret-tool lookup compass-vmtest probe </dev/null)" != "probe" ]; then
+        echo "secret-tool lookup failed: the login keyring is not usable" >&2
+        exit 1
+      fi
+      as_user secret-tool clear compass-vmtest probe </dev/null >/dev/null || true
+      echo "secret service roundtrip ok"
+    else
+      echo "no secret-tool; skipping the keyring roundtrip" >&2
+    fi
 
     # Detached like spike-a-start: ssh waits for the channel otherwise, and
     # this check would never return.
     rm -f "$sock" "$engine_done"
     : > "$engine_log"
-    # RUST_LOG rides along so the recording decisions land in the log; the
-    # assertion below greps them.
+    # -vv rides along so the recording decisions land in the log; the
+    # assertion below greps them. The CLI's own flags, not flatpak --env:
+    # options after the app id reach Compass, not flatpak, which is how a
+    # --env ended up as a clap error one round.
     setsid bash -c '
       runuser -u "$1" -- env \
         XDG_RUNTIME_DIR="/run/user/$2" \
@@ -449,8 +468,7 @@ PY
         WAYLAND_DISPLAY="$3" \
         XDG_SESSION_TYPE=wayland \
         flatpak run --installation="$4" \
-          --env=RUST_LOG=compass::clipboard_service=debug \
-          "$5" --socket "$6" serve --no-hotkey > "$7" 2>&1
+          "$5" --socket "$6" -vv serve --no-hotkey > "$7" 2>&1
       echo "$?" > "$8"
     ' _ "$SESSION_USER" "$u" "$(wayland_display)" "$INSTALLATION" "$APP" \
       "$sock" "$engine_log" "$engine_done" < /dev/null >> "$engine_log" 2>&1 &

@@ -386,7 +386,7 @@ PY
         flatpak run --installation="$INSTALLATION" "$APP" \
           --socket "$sock" "$@"
     }
-    export -f engine wayland_display
+    export -f engine wayland_display uid
     # $1: marker text. Gio over python3 carries the exact bytes; spelling a
     # GVariant byte array through gdbus quoting is how subtle bugs get in.
     set_clipboard() {

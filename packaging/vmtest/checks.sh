@@ -356,6 +356,10 @@ PY
   # the check.
   clipboard-history)
     u="$(uid)"
+    # runuser keeps root's HOME, and the keyring daemon resolves its keyring
+    # files from HOME: without this every keyring step below operates on
+    # /root's keyring while the session daemon keeps the user's locked one.
+    user_home="$(getent passwd "$SESSION_USER" | cut -d: -f6)"
     sock=/tmp/compass-clipboard-history.sock
     engine_log=/tmp/compass-clipboard-history-engine.log
     engine_done=/tmp/compass-clipboard-history-engine.done
@@ -363,14 +367,18 @@ PY
     marker_b="compass-vmtest-clipboard-beta"
     as_user() {
       runuser -u "$SESSION_USER" -- env \
+        HOME="$user_home" \
         XDG_RUNTIME_DIR="/run/user/$u" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$u/bus" \
         "$@"
     }
-    # Exported so `timeout` can run it: timeout execs its argument, and a
+    # Exported so `timeout` can run them: timeout execs its argument, and a
     # bare `timeout 120 as_user ...` dies with "No such file or directory".
-    export -f as_user
-    export SESSION_USER u
+    # The engine CLI has no socket timeout of its own, so ping and shutdown
+    # ride behind timeout too; an engine that never answers must fail the
+    # check, not the whole 75-minute job.
+    export -f as_user engine wayland_display
+    export SESSION_USER u user_home INSTALLATION APP sock
     engine() {
       as_user env \
         WAYLAND_DISPLAY="$(wayland_display)" \
@@ -393,10 +401,12 @@ proxy = Gio.DBusProxy.new_sync(
 proxy.call_sync('SetClipboard',
     # new_tuple, not a '(ay,s)' format string: PyGObject's format parser
     # rejects the byte array there (TypeError on the first VM run).
+    # Finite timeout, not -1: a handler that never replies must fail the
+    # check, not hang it past the job's timeout.
     GLib.Variant.new_tuple(
         GLib.Variant('ay', sys.argv[1].encode()),
         GLib.Variant('s', 'text/plain')),
-    Gio.DBusCallFlags.NONE, -1, None)
+    Gio.DBusCallFlags.NONE, 15000, None)
 PY
     }
     # Both markers made it through signal, ingest and store: the engine logs
@@ -437,9 +447,10 @@ PY
     # An unlocked login keyring, the way a password login leaves one: the
     # engine keeps history's master key there, and the Secret portal hands
     # the Flatpak an empty secret when nothing is unlocked (an earlier run's
-    # "too short: 0"). Creates it with this password when none exists, the
-    # way scripts/suite1/run.sh does; the keyring is the VM's throwaway.
-    echo "unlock output:"
+    # "too short: 0"). Unlock first, then verify, because --unlock exits 0
+    # even when the collection stays locked; the keyring is the VM's
+    # throwaway.
+    echo "unlocking the login keyring..."
     if ! as_user sh -c 'printf compass-vmtest-keyring | gnome-keyring-daemon --unlock --components=secrets'; then
       echo "could not unlock or create a login keyring" >&2
       exit 1
@@ -450,12 +461,38 @@ PY
       --object-path /org/freedesktop/secrets \
       --method org.freedesktop.DBus.Properties.Get \
       org.freedesktop.Secret.Service Collections 2>&1 || true
+    login_locked() {
+      as_user gdbus call --session \
+        --dest org.freedesktop.secrets \
+        --object-path /org/freedesktop/secrets/collection/login \
+        --method org.freedesktop.DBus.Properties.Get \
+        org.freedesktop.Secret.Collection Locked 2>/dev/null
+    }
+    # --unlock creates a missing login keyring but cannot open one whose
+    # password it does not know: autologin never unlocks it. A locked
+    # collection answers Store with an interaction prompt that hangs
+    # headless (an earlier round burned the whole 60s probe timeout there),
+    # so reset to a known-password keyring rather than probing a locked one.
+    if [ "$(login_locked)" != "(<false>,)" ]; then
+      echo "login collection still locked; recreating it with a known password..."
+      as_user sh -c 'rm -f "$HOME/.local/share/keyrings/login.keyring"' || true
+      if ! printf compass-vmtest-keyring | timeout 60 bash -c 'as_user gnome-keyring-daemon --replace --unlock --components=secrets'; then
+        echo "could not recreate the login keyring" >&2
+        exit 1
+      fi
+      if [ "$(login_locked)" != "(<false>,)" ]; then
+        echo "login keyring still locked after recreation: $(login_locked 2>&1 || true)" >&2
+        exit 1
+      fi
+    fi
+    echo "login keyring unlocked"
     # Prove the Secret Service answers unlocked on the session bus before the
-    # engine waits on it: stdin is closed so a lock prompt fails instead of
-    # hanging the check.
+    # engine waits on it. The secret rides on stdin: closing stdin stores an
+    # empty secret, and it does not stop a lock prompt hanging, so the state
+    # is verified above and every call here keeps its own timeout instead.
     if as_user command -v secret-tool >/dev/null; then
       echo "probing the Secret Service roundtrip..."
-      if ! timeout 60 bash -c 'as_user secret-tool store --label=compass-vmtest compass-vmtest probe' </dev/null; then
+      if ! printf %s probe | timeout 60 bash -c 'as_user secret-tool store --label=compass-vmtest compass-vmtest probe'; then
         echo "secret-tool store failed: the login keyring is not usable" >&2
         exit 1
       fi
@@ -490,24 +527,24 @@ PY
     ' _ "$SESSION_USER" "$u" "$(wayland_display)" "$INSTALLATION" "$APP" \
       "$sock" "$engine_log" "$engine_done" < /dev/null >> "$engine_log" 2>&1 &
 
-    if ! wait_for "the engine to answer ping" 120 engine ping; then
+    if ! wait_for "the engine to answer ping" 120 timeout 120 bash -c 'engine ping'; then
       echo "the engine never answered; its log:" >&2
       cat "$engine_log" >&2 || true
       exit 1
     fi
     echo "setting both markers over the bus..."
-    set_clipboard "$marker_a" || { echo "SetClipboard failed for marker_a" >&2; engine shutdown || true; exit 1; }
-    set_clipboard "$marker_b" || { echo "SetClipboard failed for marker_b" >&2; engine shutdown || true; exit 1; }
+    set_clipboard "$marker_a" || { echo "SetClipboard failed for marker_a" >&2; timeout 120 bash -c 'engine shutdown' || true; exit 1; }
+    set_clipboard "$marker_b" || { echo "SetClipboard failed for marker_b" >&2; timeout 120 bash -c 'engine shutdown' || true; exit 1; }
     if ! wait_for "both markers recorded in history" 60 recorded_both; then
       echo "the markers never landed in history; clipboard lines, then the tail:" >&2
       grep -i clipboard "$engine_log" >&2 | tail -20 || true
       tail -30 "$engine_log" >&2 || true
-      engine shutdown || true
+      timeout 120 bash -c 'engine shutdown' || true
       exit 1
     fi
     echo "clipboard history recorded both markers:"
     grep 'clipboard change' "$engine_log"
-    engine shutdown
+    timeout 120 bash -c 'engine shutdown' || true
     ;;
 
   # Spike B (#3): the same question on the target kernel. The Flatpak CI job

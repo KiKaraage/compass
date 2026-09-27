@@ -367,6 +367,10 @@ PY
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$u/bus" \
         "$@"
     }
+    # Exported so `timeout` can run it: timeout execs its argument, and a
+    # bare `timeout 120 as_user ...` dies with "No such file or directory".
+    export -f as_user
+    export SESSION_USER u
     engine() {
       as_user env \
         WAYLAND_DISPLAY="$(wayland_display)" \
@@ -417,7 +421,7 @@ PY
     # and carries a timeout: one round hung fifty minutes silent before its
     # first echo, and silence is not debuggable.
     echo "enabling the Shell extension..."
-    if ! timeout 120 as_user gnome-extensions enable compass@tunaos.org; then
+    if ! timeout 120 bash -c 'as_user gnome-extensions enable compass@tunaos.org'; then
       echo "gnome-extensions could not enable compass@tunaos.org" >&2
       as_user gnome-extensions list --details >&2 2>&1 || true
       exit 1
@@ -444,15 +448,15 @@ PY
     # hanging the check.
     if as_user command -v secret-tool >/dev/null; then
       echo "probing the Secret Service roundtrip..."
-      if ! timeout 60 as_user secret-tool store --label=compass-vmtest compass-vmtest probe </dev/null >/dev/null; then
+      if ! timeout 60 bash -c 'as_user secret-tool store --label=compass-vmtest compass-vmtest probe' </dev/null >/dev/null; then
         echo "secret-tool store failed: the login keyring is not usable" >&2
         exit 1
       fi
-      if [ "$(timeout 60 as_user secret-tool lookup compass-vmtest probe </dev/null)" != "probe" ]; then
+      if [ "$(timeout 60 bash -c 'as_user secret-tool lookup compass-vmtest probe' </dev/null)" != "probe" ]; then
         echo "secret-tool lookup failed: the login keyring is not usable" >&2
         exit 1
       fi
-      timeout 60 as_user secret-tool clear compass-vmtest probe </dev/null >/dev/null || true
+      timeout 60 bash -c 'as_user secret-tool clear compass-vmtest probe' </dev/null >/dev/null || true
       echo "secret service roundtrip ok"
     else
       echo "no secret-tool; skipping the keyring roundtrip" >&2

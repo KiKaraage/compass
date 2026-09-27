@@ -39,10 +39,16 @@ jobs:
       - name: Resolve tag
         id: meta
         shell: bash
+        # The tag rides in through the environment, never through ${{ }}
+        # interpolation: the runner expands expressions before bash parses
+        # the script, so interpolated input runs as code before the format
+        # check below ever sees it (#227).
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.tag || '' }}"
+            TAG="${INPUT_TAG:-}"
             if [[ -z "$TAG" ]]; then
               echo "When dispatching manually, you must provide 'tag' (e.g. v1.2.3)." >&2
               exit 1

@@ -342,14 +342,18 @@ PY
     fi
     ;;
 
-  # Clipboard history end to end (#238): the extension watches the clipboard,
-  # the engine records it, and `query --provider clipboard` finds it.
+  # Clipboard history end to end (#238): the extension watches the clipboard
+  # and the engine records it, read back from the engine's own log.
   #
   # SetClipboard over the session bus is the injection point: it replaces the
   # selection the way a copy presents it, and the extension emits the same
   # change signal the engine records. Two distinct markers separate "recorded
-  # at all" from "recorded twice". The engine serves on a private socket with
-  # --no-hotkey, so no portal permission prompt can stall the check.
+  # at all" from "recorded twice". The assertion reads the recording path's
+  # own `clipboard change` decisions rather than `query`: the unified query
+  # searches apps, commands, extensions and scripts, and history entries are
+  # not in it (they have their own page and request). The engine serves on a
+  # private socket with --no-hotkey, so no portal permission prompt can stall
+  # the check.
   clipboard-history)
     u="$(uid)"
     sock=/tmp/compass-clipboard-history.sock
@@ -391,12 +395,12 @@ proxy.call_sync('SetClipboard',
     Gio.DBusCallFlags.NONE, -1, None)
 PY
     }
-    history_has_both() {
-      out="$(engine query compass-vmtest-clipboard --provider clipboard --json 2>/dev/null)" || return 1
-      case "$out" in
-        *"$marker_a"*"$marker_b"*|*"$marker_b"*"$marker_a"*) return 0 ;;
-      esac
-      return 1
+    # Both markers made it through signal, ingest and store: the engine logs
+    # one `clipboard change` decision per recorded copy, and two distinct
+    # markers Insert rather than bubble up.
+    recorded_both() {
+      [ "$(grep -c 'clipboard change' "$engine_log" 2>/dev/null)" -ge 2 ] || return 1
+      grep -q 'Inserted' "$engine_log" || return 1
     }
     clipboard_version() {
       as_user gdbus call --session \
@@ -436,6 +440,8 @@ PY
     # this check would never return.
     rm -f "$sock" "$engine_done"
     : > "$engine_log"
+    # RUST_LOG rides along so the recording decisions land in the log; the
+    # assertion below greps them.
     setsid bash -c '
       runuser -u "$1" -- env \
         XDG_RUNTIME_DIR="/run/user/$2" \
@@ -443,6 +449,7 @@ PY
         WAYLAND_DISPLAY="$3" \
         XDG_SESSION_TYPE=wayland \
         flatpak run --installation="$4" "$5" \
+          --env=RUST_LOG=compass::clipboard_service=debug \
           --socket "$6" serve --no-hotkey > "$7" 2>&1
       echo "$?" > "$8"
     ' _ "$SESSION_USER" "$u" "$(wayland_display)" "$INSTALLATION" "$APP" \
@@ -455,14 +462,15 @@ PY
     fi
     set_clipboard "$marker_a" || { echo "SetClipboard failed for marker_a" >&2; engine shutdown || true; exit 1; }
     set_clipboard "$marker_b" || { echo "SetClipboard failed for marker_b" >&2; engine shutdown || true; exit 1; }
-    if ! wait_for "both markers in clipboard history" 60 history_has_both; then
-      echo "the markers never landed in history; the engine log tail:" >&2
+    if ! wait_for "both markers recorded in history" 60 recorded_both; then
+      echo "the markers never landed in history; clipboard lines, then the tail:" >&2
+      grep -i clipboard "$engine_log" >&2 | tail -20 || true
       tail -30 "$engine_log" >&2 || true
       engine shutdown || true
       exit 1
     fi
     echo "clipboard history recorded both markers:"
-    engine query compass-vmtest-clipboard --provider clipboard --json
+    grep 'clipboard change' "$engine_log"
     engine shutdown
     ;;
 

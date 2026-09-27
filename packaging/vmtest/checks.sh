@@ -413,12 +413,16 @@ PY
 
     # Self-sufficient like shell-extension: enable the helper the way a user
     # does, then wait for the Clipboard object. Without this the bus has no
-    # Clipboard path (the previous run's answer) when this check runs alone.
-    if ! as_user gnome-extensions enable compass@tunaos.org; then
+    # Clipboard path when this check runs alone. Every step narrates itself
+    # and carries a timeout: one round hung fifty minutes silent before its
+    # first echo, and silence is not debuggable.
+    echo "enabling the Shell extension..."
+    if ! timeout 120 as_user gnome-extensions enable compass@tunaos.org; then
       echo "gnome-extensions could not enable compass@tunaos.org" >&2
       as_user gnome-extensions list --details >&2 2>&1 || true
       exit 1
     fi
+    echo "waiting for the Clipboard object..."
     if ! wait_for "the Clipboard object to export contract v4" 60 clipboard_up; then
       echo "Version reads: $(clipboard_version 2>&1 || true)" >&2
       as_user gnome-extensions info compass@tunaos.org >&2 2>&1 || true
@@ -439,15 +443,16 @@ PY
     # engine waits on it: stdin is closed so a lock prompt fails instead of
     # hanging the check.
     if as_user command -v secret-tool >/dev/null; then
-      if ! as_user secret-tool store --label=compass-vmtest compass-vmtest probe </dev/null >/dev/null; then
+      echo "probing the Secret Service roundtrip..."
+      if ! timeout 60 as_user secret-tool store --label=compass-vmtest compass-vmtest probe </dev/null >/dev/null; then
         echo "secret-tool store failed: the login keyring is not usable" >&2
         exit 1
       fi
-      if [ "$(as_user secret-tool lookup compass-vmtest probe </dev/null)" != "probe" ]; then
+      if [ "$(timeout 60 as_user secret-tool lookup compass-vmtest probe </dev/null)" != "probe" ]; then
         echo "secret-tool lookup failed: the login keyring is not usable" >&2
         exit 1
       fi
-      as_user secret-tool clear compass-vmtest probe </dev/null >/dev/null || true
+      timeout 60 as_user secret-tool clear compass-vmtest probe </dev/null >/dev/null || true
       echo "secret service roundtrip ok"
     else
       echo "no secret-tool; skipping the keyring roundtrip" >&2
@@ -461,6 +466,7 @@ PY
     # assertion below greps them. The CLI's own flags, not flatpak --env:
     # options after the app id reach Compass, not flatpak, which is how a
     # --env ended up as a clap error one round.
+    echo "starting the engine on a private socket..."
     setsid bash -c '
       runuser -u "$1" -- env \
         XDG_RUNTIME_DIR="/run/user/$2" \
@@ -478,6 +484,7 @@ PY
       cat "$engine_log" >&2 || true
       exit 1
     fi
+    echo "setting both markers over the bus..."
     set_clipboard "$marker_a" || { echo "SetClipboard failed for marker_a" >&2; engine shutdown || true; exit 1; }
     set_clipboard "$marker_b" || { echo "SetClipboard failed for marker_b" >&2; engine shutdown || true; exit 1; }
     if ! wait_for "both markers recorded in history" 60 recorded_both; then

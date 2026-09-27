@@ -456,8 +456,8 @@ PY
     # password it does not know, and a locked collection answers Store with
     # an interaction prompt that hangs headless. A collection over D-Bus is
     # no escape either: the daemon password-protects it through the same
-    # prompt. So when the login keyring is unusable, drop the file it came
-    # from and restart the daemon to forget it, then unlock fresh.
+    # prompt. So when the login keyring is unusable, the session daemon is
+    # killed and a fresh one is started with a known password.
     keyring_probe() {
       printf %s probe | timeout 60 bash -c 'as_user secret-tool store --label=compass-vmtest compass-vmtest probe' || return 1
       [ "$(timeout 60 bash -c 'as_user secret-tool lookup compass-vmtest probe' </dev/null)" = "probe" ] || return 1
@@ -468,6 +468,9 @@ PY
       as_user gdbus introspect --session \
         --dest org.freedesktop.secrets \
         --object-path /org/freedesktop/secrets 2>/dev/null | grep -q org.freedesktop.Secret.Service
+    }
+    no_keyring_daemon() {
+      ! as_user pgrep -x gnome-keyring-daemon >/dev/null
     }
     if as_user command -v secret-tool >/dev/null; then
       echo "unlocking the login keyring..."
@@ -483,28 +486,37 @@ PY
         org.freedesktop.Secret.Service Collections 2>&1 || true
       echo "probing the Secret Service roundtrip..."
       if ! keyring_probe; then
-        echo "login keyring not usable; resetting it with a known password..."
-        as_user sh -c 'rm -f "$HOME/.local/share/keyrings/login.keyring"' || true
-        # The session supervises the daemon through autostart units and would
-        # restart the old one to fight the replacement, so stop those first.
-        # Discovered, not assumed: unit escaping is exact.
-        units="$(as_user systemctl --user list-units --all --no-legend 'app-gnome-*keyring*' 'gnome-keyring*' 2>/dev/null | awk '{print $1}')"
-        echo "keyring units: ${units:-none}"
-        if [ -n "$units" ]; then
-          # Splitting the unit list is the point here.
-          # shellcheck disable=SC2086
-          timeout 60 bash -c 'as_user systemctl --user stop "$@"' _ $units || true
-        fi
-        if ! printf compass-vmtest-keyring | timeout 60 bash -c 'as_user gnome-keyring-daemon --replace --unlock --components=secrets'; then
-          echo "could not recreate the login keyring" >&2
-          exit 1
-        fi
-        if ! wait_for "the recreated daemon to answer" 60 secrets_up; then
-          echo "the Secret Service never came back after --replace" >&2
-          exit 1
-        fi
-        echo "probing the Secret Service roundtrip on the reset keyring..."
-        if ! keyring_probe; then
+        # Polite replacement does not dethrone the session's login daemon:
+        # an earlier round showed the original `--daemonize --login`
+        # process still owning the bus afterwards with our --replace hung
+        # behind it. Kill every keyring daemon outright (including those
+        # hung processes), drop the unknown-password login file, and start
+        # one fresh daemon with a known password. Mask the user units first
+        # so socket activation cannot resurrect one mid-check. Retried, in
+        # case the session respawns the old daemon into the gap.
+        echo "login keyring not usable; restarting the daemon with a known password..."
+        timeout 60 bash -c 'as_user systemctl --user mask gnome-keyring-daemon.service gnome-keyring-daemon.socket' >/dev/null 2>&1 || true
+        reset_ok=0
+        for attempt in 1 2 3; do
+          echo "keyring reset attempt $attempt/3..."
+          as_user pkill -x gnome-keyring-daemon || true
+          if ! wait_for "all keyring daemons to exit" 30 no_keyring_daemon; then
+            echo "keyring daemons would not exit" >&2
+            continue
+          fi
+          as_user sh -c 'rm -f "$HOME/.local/share/keyrings/login.keyring"' || true
+          if ! printf compass-vmtest-keyring | timeout 60 bash -c 'as_user gnome-keyring-daemon --daemonize --unlock --components=secrets'; then
+            echo "could not start a fresh keyring daemon" >&2
+            continue
+          fi
+          if ! wait_for "the fresh daemon to answer" 60 secrets_up; then
+            echo "the fresh daemon never answered" >&2
+            continue
+          fi
+          if keyring_probe; then reset_ok=1; break; fi
+          echo "roundtrip failed on attempt $attempt" >&2
+        done
+        if [ "$reset_ok" != 1 ]; then
           echo "roundtrip failed on a reset keyring; keyring state:" >&2
           as_user sh -c 'ps -o pid,args -C gnome-keyring-daemon' >&2 2>&1 || true
           timeout 30 bash -c 'as_user busctl --user status org.freedesktop.secrets' >&2 2>&1 || true

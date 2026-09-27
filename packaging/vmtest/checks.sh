@@ -503,12 +503,13 @@ bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 svc = Gio.DBusProxy.new_sync(bus, Gio.DBusProxyFlags.NONE, None,
     'org.freedesktop.secrets', '/org/freedesktop/secrets',
     'org.freedesktop.Secret.Service', None)
+# The daemon only supports the 'default' alias here, which both names
+# the collection and points the alias at it: exactly what the portal
+# serves the Flatpak from.
 props = {'org.freedesktop.Secret.Collection.Label': GLib.Variant('s', 'compass-vmtest')}
 path, _prompt = svc.call_sync('CreateCollection',
-    GLib.Variant('(a{sv}s)', (props, 'compass-vmtest')),
+    GLib.Variant('(a{sv}s)', (props, 'default')),
     Gio.DBusCallFlags.NONE, 15000, None).unpack()
-svc.call_sync('SetAlias', GLib.Variant('(so)', ('default', path)),
-    Gio.DBusCallFlags.NONE, 15000, None)
 print(path)
 PY
         )" || { echo "could not create the sidecar collection" >&2; exit 1; }

@@ -383,7 +383,11 @@ proxy = Gio.DBusProxy.new_sync(
     '/org/tunaos/compass/Shell/Clipboard',
     'org.tunaos.compass.Shell.Clipboard', None)
 proxy.call_sync('SetClipboard',
-    GLib.Variant('(ay,s)', (sys.argv[1].encode(), 'text/plain')),
+    # new_tuple, not a '(ay,s)' format string: PyGObject's format parser
+    # rejects the byte array there (TypeError on the first VM run).
+    GLib.Variant.new_tuple(
+        GLib.Variant('ay', sys.argv[1].encode()),
+        GLib.Variant('s', 'text/plain')),
     Gio.DBusCallFlags.NONE, -1, None)
 PY
     }

@@ -448,9 +448,9 @@ PY
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$2/bus" \
         WAYLAND_DISPLAY="$3" \
         XDG_SESSION_TYPE=wayland \
-        flatpak run --installation="$4" "$5" \
+        flatpak run --installation="$4" \
           --env=RUST_LOG=compass::clipboard_service=debug \
-          --socket "$6" serve --no-hotkey > "$7" 2>&1
+          "$5" --socket "$6" serve --no-hotkey > "$7" 2>&1
       echo "$?" > "$8"
     ' _ "$SESSION_USER" "$u" "$(wayland_display)" "$INSTALLATION" "$APP" \
       "$sock" "$engine_log" "$engine_done" < /dev/null >> "$engine_log" 2>&1 &

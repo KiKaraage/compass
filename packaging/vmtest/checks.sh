@@ -470,7 +470,10 @@ PY
         --object-path /org/freedesktop/secrets 2>/dev/null | grep -q org.freedesktop.Secret.Service
     }
     no_keyring_daemon() {
-      ! as_user pgrep -x gnome-keyring-daemon >/dev/null
+      # -f with a bracketed first letter: comm caps at 15 chars so -x can
+      # never match, and the brackets keep the wrapper's own command line
+      # from matching the pattern.
+      ! as_user pgrep -f '[g]nome-keyring-daemon' >/dev/null
     }
     if as_user command -v secret-tool >/dev/null; then
       echo "unlocking the login keyring..."
@@ -499,7 +502,7 @@ PY
         reset_ok=0
         for attempt in 1 2 3; do
           echo "keyring reset attempt $attempt/3..."
-          as_user pkill -x gnome-keyring-daemon || true
+          as_user pkill -f '[g]nome-keyring-daemon' || true
           if ! wait_for "all keyring daemons to exit" 30 no_keyring_daemon; then
             echo "keyring daemons would not exit" >&2
             continue

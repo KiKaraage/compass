@@ -446,36 +446,34 @@ PY
     echo "clipboard up: $(clipboard_version)"
 
     # An unlocked login keyring, the way a password login leaves one: the
-    # engine keeps history's master key there, and the Secret portal hands
-    # the Flatpak an empty secret when nothing is unlocked (an earlier run's
-    # "too short: 0"). Unlock first, then verify, because --unlock exits 0
-    # even when the collection stays locked; the keyring is the VM's
-    # throwaway.
-    echo "unlocking the login keyring..."
-    if ! as_user sh -c 'printf compass-vmtest-keyring | gnome-keyring-daemon --unlock --components=secrets'; then
-      echo "could not unlock or create a login keyring" >&2
-      exit 1
-    fi
-    echo "secret service collections:"
-    as_user gdbus call --session \
-      --dest org.freedesktop.secrets \
-      --object-path /org/freedesktop/secrets \
-      --method org.freedesktop.DBus.Properties.Get \
-      org.freedesktop.Secret.Service Collections 2>&1 || true
-    # A store/lookup roundtrip through the Secret Service. This is the ground
-    # truth the engine needs: it keeps history's master key there, and the
-    # Secret portal hands the Flatpak an empty secret when nothing is
-    # unlocked (an earlier run's "too short: 0"). The secret rides on stdin:
-    # closing stdin stores an empty secret. Every call keeps its own
-    # timeout, because a lock prompt hangs headless.
+    # engine keeps history's master key there, and without it the service
+    # logs "clipboard history unavailable" and records nothing — there is no
+    # unencrypted fallback. The roundtrip probe below is the ground truth;
+    # the keyring is the VM's throwaway.
+    #
+    # --unlock is the only non-interactive primitive: it creates a missing
+    # login keyring with the password on stdin, but cannot open one whose
+    # password it does not know, and a locked collection answers Store with
+    # an interaction prompt that hangs headless. A collection over D-Bus is
+    # no escape either: the daemon password-protects it through the same
+    # prompt. So when the login keyring is unusable, drop the file it came
+    # from and restart the daemon to forget it, then unlock fresh.
     keyring_probe() {
       printf %s probe | timeout 60 bash -c 'as_user secret-tool store --label=compass-vmtest compass-vmtest probe' || return 1
       [ "$(timeout 60 bash -c 'as_user secret-tool lookup compass-vmtest probe' </dev/null)" = "probe" ] || return 1
       timeout 60 bash -c 'as_user secret-tool clear compass-vmtest probe' </dev/null >/dev/null || true
       return 0
     }
+    secrets_up() {
+      as_user gdbus introspect --session \
+        --dest org.freedesktop.secrets \
+        --object-path /org/freedesktop/secrets 2>/dev/null | grep -q org.freedesktop.Secret.Service
+    }
     if as_user command -v secret-tool >/dev/null; then
       echo "unlocking the login keyring..."
+      # An empty password first: the session daemon can hold an
+      # auto-created blank login keyring, which our password does not open.
+      as_user sh -c 'printf "" | gnome-keyring-daemon --unlock --components=secrets' || true
       as_user sh -c 'printf compass-vmtest-keyring | gnome-keyring-daemon --unlock --components=secrets' || true
       echo "secret service collections:"
       as_user gdbus call --session \
@@ -484,43 +482,36 @@ PY
         --method org.freedesktop.DBus.Properties.Get \
         org.freedesktop.Secret.Service Collections 2>&1 || true
       echo "probing the Secret Service roundtrip..."
-      if keyring_probe; then
-        echo "secret service roundtrip ok"
-      else
-        # --unlock cannot open a login keyring whose password it does not
-        # know: autologin never unlocks it, and a locked collection answers
-        # Store with an interaction prompt that hangs headless. Rather than
-        # wrestling the session daemon's password, create an unlocked
-        # collection over D-Bus and point the default alias at it: the
-        # Secret portal serves the Flatpak from the default collection.
-        # Throwaway VM, so nothing is restored afterwards.
-        echo "login keyring not usable; creating an unlocked sidecar collection..."
-        # `python3 -`, not /dev/stdin: reopening the stdin pipe through
-        # runuser fails with EACCES, while reading fd 0 works.
-        sidecar_path="$(timeout 120 bash -c 'as_user python3 -' <<'PY'
-from gi.repository import Gio, GLib
-bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-svc = Gio.DBusProxy.new_sync(bus, Gio.DBusProxyFlags.NONE, None,
-    'org.freedesktop.secrets', '/org/freedesktop/secrets',
-    'org.freedesktop.Secret.Service', None)
-# The daemon only supports the 'default' alias here, which both names
-# the collection and points the alias at it: exactly what the portal
-# serves the Flatpak from.
-props = {'org.freedesktop.Secret.Collection.Label': GLib.Variant('s', 'compass-vmtest')}
-path, _prompt = svc.call_sync('CreateCollection',
-    GLib.Variant('(a{sv}s)', (props, 'default')),
-    Gio.DBusCallFlags.NONE, 15000, None).unpack()
-print(path)
-PY
-        )" || { echo "could not create the sidecar collection" >&2; exit 1; }
-        echo "sidecar collection: $sidecar_path"
-        echo "probing the Secret Service roundtrip on the sidecar..."
-        if ! keyring_probe; then
-          echo "roundtrip failed even on a fresh unlocked collection" >&2
+      if ! keyring_probe; then
+        echo "login keyring not usable; resetting it with a known password..."
+        as_user sh -c 'rm -f "$HOME/.local/share/keyrings/login.keyring"' || true
+        # The session supervises the daemon through autostart units and would
+        # restart the old one to fight the replacement, so stop those first.
+        # Discovered, not assumed: unit escaping is exact.
+        units="$(as_user systemctl --user list-units --all --no-legend 'app-gnome-*keyring*' 'gnome-keyring*' 2>/dev/null | awk '{print $1}')"
+        echo "keyring units: ${units:-none}"
+        if [ -n "$units" ]; then
+          # Splitting the unit list is the point here.
+          # shellcheck disable=SC2086
+          timeout 60 bash -c 'as_user systemctl --user stop "$@"' _ $units || true
+        fi
+        if ! printf compass-vmtest-keyring | timeout 60 bash -c 'as_user gnome-keyring-daemon --replace --unlock --components=secrets'; then
+          echo "could not recreate the login keyring" >&2
           exit 1
         fi
-        echo "secret service roundtrip ok"
+        if ! wait_for "the recreated daemon to answer" 60 secrets_up; then
+          echo "the Secret Service never came back after --replace" >&2
+          exit 1
+        fi
+        echo "probing the Secret Service roundtrip on the reset keyring..."
+        if ! keyring_probe; then
+          echo "roundtrip failed on a reset keyring; keyring state:" >&2
+          as_user sh -c 'ps -o pid,args -C gnome-keyring-daemon' >&2 2>&1 || true
+          timeout 30 bash -c 'as_user busctl --user status org.freedesktop.secrets' >&2 2>&1 || true
+          exit 1
+        fi
       fi
+      echo "secret service roundtrip ok"
     else
       echo "no secret-tool; skipping the keyring roundtrip" >&2
     fi

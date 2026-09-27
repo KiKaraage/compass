@@ -439,16 +439,23 @@ PY
     # the Flatpak an empty secret when nothing is unlocked (an earlier run's
     # "too short: 0"). Creates it with this password when none exists, the
     # way scripts/suite1/run.sh does; the keyring is the VM's throwaway.
-    if ! as_user sh -c 'printf compass-vmtest-keyring | gnome-keyring-daemon --unlock --components=secrets >/dev/null'; then
+    echo "unlock output:"
+    if ! as_user sh -c 'printf compass-vmtest-keyring | gnome-keyring-daemon --unlock --components=secrets'; then
       echo "could not unlock or create a login keyring" >&2
       exit 1
     fi
+    echo "secret service collections:"
+    as_user gdbus call --session \
+      --dest org.freedesktop.secrets \
+      --object-path /org/freedesktop/secrets \
+      --method org.freedesktop.DBus.Properties.Get \
+      org.freedesktop.Secret.Service Collections 2>&1 || true
     # Prove the Secret Service answers unlocked on the session bus before the
     # engine waits on it: stdin is closed so a lock prompt fails instead of
     # hanging the check.
     if as_user command -v secret-tool >/dev/null; then
       echo "probing the Secret Service roundtrip..."
-      if ! timeout 60 bash -c 'as_user secret-tool store --label=compass-vmtest compass-vmtest probe' </dev/null >/dev/null; then
+      if ! timeout 60 bash -c 'as_user secret-tool store --label=compass-vmtest compass-vmtest probe' </dev/null; then
         echo "secret-tool store failed: the login keyring is not usable" >&2
         exit 1
       fi

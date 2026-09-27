@@ -218,7 +218,15 @@ jobs:
           # And the GNOME Shell extension, for the same reason: the image
           # installs the in-tree copy, the one the contract test checks.
           cp -r extensions/gnome-shell/compass@tunaos.org packaging/vmtest/
-          sudo podman build \
+          # --isolation chroot (#240): the image's RUN steps run
+          # `flatpak install`, and flatpak sandboxes the deploy with bwrap.
+          # Under buildah's default oci isolation that bwrap nests inside the
+          # build container's own user namespace, which current runners deny
+          # ("Creating new namespace failed"). Chroot isolation runs RUN steps
+          # without an outer namespace, so flatpak's bwrap nests zero deep —
+          # the same shape flatpak-builder already builds with. Rootful-only,
+          # and this command is already sudo.
+          sudo podman build --isolation chroot \
             -t localhost/bluefin-compass:ci \
             -f packaging/vmtest/Containerfile.compass \
             packaging/vmtest
@@ -329,7 +337,7 @@ jobs:
 
       - name: Build the test image
         run: |
-          sudo podman build \
+          sudo podman build --isolation chroot \
             -t localhost/bluefin-compass:ci \
             -f packaging/vmtest/Containerfile.compass \
             packaging/vmtest
@@ -470,7 +478,7 @@ jobs:
 
       - name: Build the test image
         run: |
-          sudo podman build \
+          sudo podman build --isolation chroot \
             -t localhost/bluefin-compass:ci \
             -f packaging/vmtest/Containerfile.compass \
             packaging/vmtest

@@ -495,7 +495,9 @@ PY
         # Secret portal serves the Flatpak from the default collection.
         # Throwaway VM, so nothing is restored afterwards.
         echo "login keyring not usable; creating an unlocked sidecar collection..."
-        sidecar_path="$(timeout 120 bash -c 'as_user python3 /dev/stdin' <<'PY'
+        # `python3 -`, not /dev/stdin: reopening the stdin pipe through
+        # runuser fails with EACCES, while reading fd 0 works.
+        sidecar_path="$(timeout 120 bash -c 'as_user python3 -' <<'PY'
 from gi.repository import Gio, GLib
 bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 svc = Gio.DBusProxy.new_sync(bus, Gio.DBusProxyFlags.NONE, None,

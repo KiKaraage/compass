@@ -422,6 +422,16 @@ PY
     fi
     echo "clipboard up: $(clipboard_version)"
 
+    # An unlocked login keyring, the way a password login leaves one: the
+    # engine keeps history's master key there, and the Secret portal hands
+    # the Flatpak an empty secret when nothing is unlocked (the last run's
+    # "too short: 0"). Creates it with this password when none exists, the
+    # way scripts/suite1/run.sh does; the keyring is the VM's throwaway.
+    if ! as_user sh -c 'printf compass-vmtest-keyring | gnome-keyring-daemon --unlock --components=secrets >/dev/null'; then
+      echo "could not unlock or create a login keyring" >&2
+      exit 1
+    fi
+
     # Detached like spike-a-start: ssh waits for the channel otherwise, and
     # this check would never return.
     rm -f "$sock" "$engine_done"

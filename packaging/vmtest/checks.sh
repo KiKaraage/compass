@@ -377,7 +377,7 @@ PY
     # The engine CLI has no socket timeout of its own, so ping and shutdown
     # ride behind timeout too; an engine that never answers must fail the
     # check, not the whole 75-minute job.
-    export -f as_user engine wayland_display
+    export -f as_user
     export SESSION_USER u user_home INSTALLATION APP sock
     engine() {
       as_user env \
@@ -386,6 +386,7 @@ PY
         flatpak run --installation="$INSTALLATION" "$APP" \
           --socket "$sock" "$@"
     }
+    export -f engine wayland_display
     # $1: marker text. Gio over python3 carries the exact bytes; spelling a
     # GVariant byte array through gdbus quoting is how subtle bugs get in.
     set_clipboard() {

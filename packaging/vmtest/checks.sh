@@ -398,6 +398,29 @@ PY
       esac
       return 1
     }
+    clipboard_version() {
+      as_user gdbus call --session \
+        --dest org.gnome.Shell \
+        --object-path /org/tunaos/compass/Shell/Clipboard \
+        --method org.freedesktop.DBus.Properties.Get \
+        org.tunaos.compass.Shell.Clipboard Version
+    }
+    clipboard_up() { case "$(clipboard_version 2>/dev/null)" in *"uint32 4>"*) return 0 ;; esac; return 1; }
+
+    # Self-sufficient like shell-extension: enable the helper the way a user
+    # does, then wait for the Clipboard object. Without this the bus has no
+    # Clipboard path (the previous run's answer) when this check runs alone.
+    if ! as_user gnome-extensions enable compass@tunaos.org; then
+      echo "gnome-extensions could not enable compass@tunaos.org" >&2
+      as_user gnome-extensions list --details >&2 2>&1 || true
+      exit 1
+    fi
+    if ! wait_for "the Clipboard object to export contract v4" 60 clipboard_up; then
+      echo "Version reads: $(clipboard_version 2>&1 || true)" >&2
+      as_user gnome-extensions info compass@tunaos.org >&2 2>&1 || true
+      exit 1
+    fi
+    echo "clipboard up: $(clipboard_version)"
 
     # Detached like spike-a-start: ssh waits for the channel otherwise, and
     # this check would never return.

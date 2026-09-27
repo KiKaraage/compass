@@ -5,9 +5,10 @@ set -euo pipefail
 # Atomically bump the project version:
 #   1. write the new tag + the commit it is based on into the manifest
 #   2. move every version source to the tag (workspace Cargo.toml, Nix, the
-#      Flatpak metainfo, the Arch pkgver prefix): `compass --version` reports
-#      CARGO_PKG_VERSION, and crates/compass/tests/version_sync.rs fails while
-#      it disagrees with the manifest tag
+#      Flatpak metainfo, the Arch pkgver prefix, the Homebrew formula's url):
+#      `compass --version` reports CARGO_PKG_VERSION, and
+#      crates/compass/tests/version_sync.rs fails while it disagrees with
+#      the manifest tag
 #   3. commit the version changes
 #   4. tag *that* commit
 #
@@ -23,12 +24,17 @@ bump_version() {
         exit 1
     fi
 
-    # Use the highest version tag across the whole repo, not just tags reachable
-    # from HEAD: bump commits are tagged but never merged back into the working
-    # branch, so `git describe` would miss the most recent release and we'd
-    # recompute a version that already exists.
+    # The manifest names the last release, so it is the source of truth — not
+    # the tag list. Tags may be missing from a fresh clone (or were never
+    # pushed), and deriving from them then recomputes a version that already
+    # exists: with no tags at all, `v0.0.0` + patch yields `v0.0.1` on top of
+    # a `v0.28.1` manifest. Git tags are only the fallback for a manifest
+    # that names nothing yet.
     local current_tag
-    current_tag=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+    current_tag=$(yq -r '.release.tag // ""' "$manifest")
+    if [ -z "$current_tag" ]; then
+        current_tag=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+    fi
     current_tag=${current_tag:-v0.0.0}
 
     local current_version=${current_tag#v}
@@ -69,14 +75,29 @@ bump_version() {
     sed -i "s/^pkgver=.*/pkgver=${bare}.r0.g0000000/" "$repo_root/packaging/arch/PKGBUILD"
     sed -i "s/printf '[0-9.]*\.r%s\.g%s'/printf '${bare}.r%s.g%s'/" \
         "$repo_root/packaging/arch/PKGBUILD"
+    # The in-tree Homebrew formula tracks the tag; its sha256 cannot follow
+    # (the tarball exists only after the tag is pushed), so the bump resets
+    # it to the placeholder and filling it is part of the release. A stale
+    # hash would fail the install; the placeholder fails the audit first.
+    sed -i "s|/tags/v[0-9.]*\.tar\.gz|/tags/${new_version}.tar.gz|" \
+        "$repo_root/packaging/homebrew/compass.rb"
+    sed -i 's/^\s*sha256 "[0-9a-f]\{64\}"$/  sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"/' \
+        "$repo_root/packaging/homebrew/compass.rb"
+    # Refreshing the lock needs the registry: a fresh clone's cache misses
+    # crates for targets it never built (e.g. android-activity), and --offline
+    # fails there. A release pushes right after, so network is assumed; a
+    # missing cargo is still only a warning, and --locked builds (Flatpak,
+    # Homebrew) fail loudly on a stale lock rather than shipping it.
     if command -v cargo >/dev/null 2>&1; then
-        (cd "$repo_root" && cargo metadata --format-version=1 --offline >/dev/null)
+        (cd "$repo_root" && cargo metadata --format-version=1 >/dev/null)
+    else
+        echo "warning: no cargo; Cargo.lock still names the old version" >&2
     fi
 
     git add "$manifest" Cargo.toml Cargo.lock \
         packaging/nix/compass.nix packaging/nix/extension-runtime.nix \
         packaging/flatpak/org.tunaos.compass.metainfo.xml \
-        packaging/arch/PKGBUILD
+        packaging/arch/PKGBUILD packaging/homebrew/compass.rb
     git commit -m "chore: bump to ${new_version}"
     git tag "${new_version}"
 

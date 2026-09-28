@@ -200,9 +200,17 @@ fn every_long_running_vm_tier_invocation_parses_too() {
     );
 
     for (line, args) in &sites {
-        let argv: Vec<&str> = std::iter::once("compass")
+        let mut argv: Vec<&str> = std::iter::once("compass")
             .chain(args.iter().map(String::as_str))
             .collect();
+
+        // A forwarder ends in `"$@"`: fixed flags up front, the caller's
+        // subcommand behind them. The caller side cannot be checked
+        // statically, so `ping` stands in for it and the fixed flags are
+        // checked exactly like every other site.
+        if argv.last() == Some(&"$@") {
+            *argv.last_mut().expect("argv holds compass") = "ping";
+        }
 
         if let Err(err) = Cli::try_parse_from(&argv) {
             panic!(

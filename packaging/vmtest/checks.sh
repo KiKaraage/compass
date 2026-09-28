@@ -342,6 +342,236 @@ PY
     fi
     ;;
 
+  # Clipboard history end to end (#238): the extension watches the clipboard
+  # and the engine records it, read back from the engine's own log.
+  #
+  # SetClipboard over the session bus is the injection point: it replaces the
+  # selection the way a copy presents it, and the extension emits the same
+  # change signal the engine records. Two distinct markers separate "recorded
+  # at all" from "recorded twice". The assertion reads the recording path's
+  # own `clipboard change` decisions rather than `query`: the unified query
+  # searches apps, commands, extensions and scripts, and history entries are
+  # not in it (they have their own page and request). The engine serves on a
+  # private socket with --no-hotkey, so no portal permission prompt can stall
+  # the check.
+  clipboard-history)
+    u="$(uid)"
+    # runuser keeps root's HOME, and the keyring daemon resolves its keyring
+    # files from HOME: without this every keyring step below operates on
+    # /root's keyring while the session daemon keeps the user's locked one.
+    user_home="$(getent passwd "$SESSION_USER" | cut -d: -f6)"
+    sock=/tmp/compass-clipboard-history.sock
+    engine_log=/tmp/compass-clipboard-history-engine.log
+    engine_done=/tmp/compass-clipboard-history-engine.done
+    marker_a="compass-vmtest-clipboard-alpha"
+    marker_b="compass-vmtest-clipboard-beta"
+    as_user() {
+      runuser -u "$SESSION_USER" -- env \
+        HOME="$user_home" \
+        XDG_RUNTIME_DIR="/run/user/$u" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$u/bus" \
+        "$@"
+    }
+    # Exported so `timeout` can run them: timeout execs its argument, and a
+    # bare `timeout 120 as_user ...` dies with "No such file or directory".
+    # The engine CLI has no socket timeout of its own, so ping and shutdown
+    # ride behind timeout too; an engine that never answers must fail the
+    # check, not the whole 75-minute job.
+    export -f as_user
+    export SESSION_USER u user_home INSTALLATION APP sock
+    engine() {
+      as_user env \
+        WAYLAND_DISPLAY="$(wayland_display)" \
+        XDG_SESSION_TYPE=wayland \
+        flatpak run --installation="$INSTALLATION" "$APP" \
+          --socket "$sock" "$@"
+    }
+    export -f engine wayland_display uid
+    # $1: marker text. Gio over python3 carries the exact bytes; spelling a
+    # GVariant byte array through gdbus quoting is how subtle bugs get in.
+    set_clipboard() {
+      as_user python3 - "$1" <<'PY'
+import sys
+from gi.repository import Gio, GLib
+proxy = Gio.DBusProxy.new_sync(
+    Gio.bus_get_sync(Gio.BusType.SESSION, None),
+    Gio.DBusProxyFlags.NONE, None,
+    'org.gnome.Shell',
+    '/org/tunaos/compass/Shell/Clipboard',
+    'org.tunaos.compass.Shell.Clipboard', None)
+proxy.call_sync('SetClipboard',
+    # new_tuple, not a '(ay,s)' format string: PyGObject's format parser
+    # rejects the byte array there (TypeError on the first VM run).
+    # Finite timeout, not -1: a handler that never replies must fail the
+    # check, not hang it past the job's timeout.
+    GLib.Variant.new_tuple(
+        GLib.Variant('ay', sys.argv[1].encode()),
+        GLib.Variant('s', 'text/plain')),
+    Gio.DBusCallFlags.NONE, 15000, None)
+PY
+    }
+    # Both markers made it through signal, ingest and store: the engine logs
+    # one `clipboard change` decision per recorded copy, and two distinct
+    # markers Insert rather than bubble up.
+    recorded_both() {
+      [ "$(grep -c 'clipboard change' "$engine_log" 2>/dev/null)" -ge 2 ] || return 1
+      grep -q 'Inserted' "$engine_log" || return 1
+    }
+    clipboard_version() {
+      as_user gdbus call --session \
+        --dest org.gnome.Shell \
+        --object-path /org/tunaos/compass/Shell/Clipboard \
+        --method org.freedesktop.DBus.Properties.Get \
+        org.tunaos.compass.Shell.Clipboard Version
+    }
+    clipboard_up() { case "$(clipboard_version 2>/dev/null)" in *"uint32 4>"*) return 0 ;; esac; return 1; }
+
+    # Self-sufficient like shell-extension: enable the helper the way a user
+    # does, then wait for the Clipboard object. Without this the bus has no
+    # Clipboard path when this check runs alone. Every step narrates itself
+    # and carries a timeout: one round hung fifty minutes silent before its
+    # first echo, and silence is not debuggable.
+    echo "enabling the Shell extension..."
+    if ! timeout 120 bash -c 'as_user gnome-extensions enable compass@tunaos.org'; then
+      echo "gnome-extensions could not enable compass@tunaos.org" >&2
+      as_user gnome-extensions list --details >&2 2>&1 || true
+      exit 1
+    fi
+    echo "waiting for the Clipboard object..."
+    if ! wait_for "the Clipboard object to export contract v4" 60 clipboard_up; then
+      echo "Version reads: $(clipboard_version 2>&1 || true)" >&2
+      as_user gnome-extensions info compass@tunaos.org >&2 2>&1 || true
+      exit 1
+    fi
+    echo "clipboard up: $(clipboard_version)"
+
+    # An unlocked login keyring, the way a password login leaves one: the
+    # engine keeps history's master key there, and without it the service
+    # logs "clipboard history unavailable" and records nothing — there is no
+    # unencrypted fallback. The roundtrip probe below is the ground truth;
+    # the keyring is the VM's throwaway.
+    #
+    # --unlock is the only non-interactive primitive: it creates a missing
+    # login keyring with the password on stdin, but cannot open one whose
+    # password it does not know, and a locked collection answers Store with
+    # an interaction prompt that hangs headless. A collection over D-Bus is
+    # no escape either: the daemon password-protects it through the same
+    # prompt. So when the login keyring is unusable, the session daemon is
+    # killed and a fresh one is started with a known password.
+    keyring_probe() {
+      printf %s probe | timeout 60 bash -c 'as_user secret-tool store --label=compass-vmtest compass-vmtest probe' || return 1
+      [ "$(timeout 60 bash -c 'as_user secret-tool lookup compass-vmtest probe' </dev/null)" = "probe" ] || return 1
+      timeout 60 bash -c 'as_user secret-tool clear compass-vmtest probe' </dev/null >/dev/null || true
+      return 0
+    }
+    secrets_up() {
+      as_user gdbus introspect --session \
+        --dest org.freedesktop.secrets \
+        --object-path /org/freedesktop/secrets 2>/dev/null | grep -q org.freedesktop.Secret.Service
+    }
+    no_keyring_daemon() {
+      # -f with a bracketed first letter: comm caps at 15 chars so -x can
+      # never match, and the brackets keep the wrapper's own command line
+      # from matching the pattern.
+      ! as_user pgrep -f '[g]nome-keyring-daemon' >/dev/null
+    }
+    if as_user command -v secret-tool >/dev/null; then
+      echo "unlocking the login keyring..."
+      # An empty password first: the session daemon can hold an
+      # auto-created blank login keyring, which our password does not open.
+      as_user sh -c 'printf "" | gnome-keyring-daemon --unlock --components=secrets' || true
+      as_user sh -c 'printf compass-vmtest-keyring | gnome-keyring-daemon --unlock --components=secrets' || true
+      echo "secret service collections:"
+      as_user gdbus call --session \
+        --dest org.freedesktop.secrets \
+        --object-path /org/freedesktop/secrets \
+        --method org.freedesktop.DBus.Properties.Get \
+        org.freedesktop.Secret.Service Collections 2>&1 || true
+      echo "probing the Secret Service roundtrip..."
+      if ! keyring_probe; then
+        # Polite replacement does not dethrone the session's login daemon:
+        # an earlier round showed the original `--daemonize --login`
+        # process still owning the bus afterwards with our --replace hung
+        # behind it. Kill every keyring daemon outright (including those
+        # hung processes), drop the unknown-password login file, and start
+        # one fresh daemon with a known password. Mask the user units first
+        # so socket activation cannot resurrect one mid-check. Retried, in
+        # case the session respawns the old daemon into the gap.
+        echo "login keyring not usable; restarting the daemon with a known password..."
+        timeout 60 bash -c 'as_user systemctl --user mask gnome-keyring-daemon.service gnome-keyring-daemon.socket' >/dev/null 2>&1 || true
+        reset_ok=0
+        for attempt in 1 2 3; do
+          echo "keyring reset attempt $attempt/3..."
+          as_user pkill -f '[g]nome-keyring-daemon' || true
+          if ! wait_for "all keyring daemons to exit" 30 no_keyring_daemon; then
+            echo "keyring daemons would not exit" >&2
+            continue
+          fi
+          as_user sh -c 'rm -f "$HOME/.local/share/keyrings/login.keyring"' || true
+          if ! printf compass-vmtest-keyring | timeout 60 bash -c 'as_user gnome-keyring-daemon --daemonize --unlock --components=secrets'; then
+            echo "could not start a fresh keyring daemon" >&2
+            continue
+          fi
+          if ! wait_for "the fresh daemon to answer" 60 secrets_up; then
+            echo "the fresh daemon never answered" >&2
+            continue
+          fi
+          if keyring_probe; then reset_ok=1; break; fi
+          echo "roundtrip failed on attempt $attempt" >&2
+        done
+        if [ "$reset_ok" != 1 ]; then
+          echo "roundtrip failed on a reset keyring; keyring state:" >&2
+          as_user sh -c 'ps -o pid,args -C gnome-keyring-daemon' >&2 2>&1 || true
+          timeout 30 bash -c 'as_user busctl --user status org.freedesktop.secrets' >&2 2>&1 || true
+          exit 1
+        fi
+      fi
+      echo "secret service roundtrip ok"
+    else
+      echo "no secret-tool; skipping the keyring roundtrip" >&2
+    fi
+
+    # Detached like spike-a-start: ssh waits for the channel otherwise, and
+    # this check would never return.
+    rm -f "$sock" "$engine_done"
+    : > "$engine_log"
+    # -vv rides along so the recording decisions land in the log; the
+    # assertion below greps them. The CLI's own flags, not flatpak --env:
+    # options after the app id reach Compass, not flatpak, which is how a
+    # --env ended up as a clap error one round.
+    echo "starting the engine on a private socket..."
+    setsid bash -c '
+      runuser -u "$1" -- env \
+        XDG_RUNTIME_DIR="/run/user/$2" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$2/bus" \
+        WAYLAND_DISPLAY="$3" \
+        XDG_SESSION_TYPE=wayland \
+        flatpak run --installation="$4" \
+          "$5" --socket "$6" -vv serve --no-hotkey > "$7" 2>&1
+      echo "$?" > "$8"
+    ' _ "$SESSION_USER" "$u" "$(wayland_display)" "$INSTALLATION" "$APP" \
+      "$sock" "$engine_log" "$engine_done" < /dev/null >> "$engine_log" 2>&1 &
+
+    if ! wait_for "the engine to answer ping" 120 timeout 120 bash -c 'engine ping'; then
+      echo "the engine never answered; its log:" >&2
+      cat "$engine_log" >&2 || true
+      exit 1
+    fi
+    echo "setting both markers over the bus..."
+    set_clipboard "$marker_a" || { echo "SetClipboard failed for marker_a" >&2; timeout 120 bash -c 'engine shutdown' || true; exit 1; }
+    set_clipboard "$marker_b" || { echo "SetClipboard failed for marker_b" >&2; timeout 120 bash -c 'engine shutdown' || true; exit 1; }
+    if ! wait_for "both markers recorded in history" 60 recorded_both; then
+      echo "the markers never landed in history; clipboard lines, then the tail:" >&2
+      grep -i clipboard "$engine_log" >&2 | tail -20 || true
+      tail -30 "$engine_log" >&2 || true
+      timeout 120 bash -c 'engine shutdown' || true
+      exit 1
+    fi
+    echo "clipboard history recorded both markers:"
+    grep 'clipboard change' "$engine_log"
+    timeout 120 bash -c 'engine shutdown' || true
+    ;;
+
   # Spike B (#3): the same question on the target kernel. The Flatpak CI job
   # answers it in three minutes on the runner's kernel; this one answers it on
   # Bluefin's, which is what actually ships, and Landlock's ABI is a kernel

@@ -45,7 +45,7 @@ mod calculator;
 mod files;
 mod launch;
 mod openers;
-mod settings;
+pub(crate) mod settings;
 mod storage;
 mod workspaces;
 
@@ -182,8 +182,12 @@ impl EngineState {
         // A bad config is reported and then ignored rather than fatal. Refusing
         // to start because `max_results` is misspelled would be a worse outcome
         // than starting with the default and saying so.
-        let config = match Config::load() {
-            Ok(config) => config,
+        let config = match Config::load_with_issues() {
+            Ok((config, issues)) => {
+                let _ = compass_ui::theme::load_default_user_themes();
+                crate::config_watch::log_issues(&crate::config_watch::check(&config, issues));
+                config
+            }
             Err(err) => {
                 let fallback = Config::default();
                 tracing::warn!(error = %err, "using default configuration");
@@ -1203,11 +1207,63 @@ async fn paste_text(state: &Arc<RwLock<EngineState>>, text: String) -> Response 
     .await
 }
 
+/// `ClipboardService::copyText` for the window: the text goes on a clipboard
+/// the engine owns, so it outlives the window that asked. Over data-control
+/// on wlroots, through the Shell extension elsewhere.
+async fn copy_text(state: &Arc<RwLock<EngineState>>, text: String) -> Response {
+    const WHAT: &str = "Copying";
+    if crate::wlroots::detect()
+        .await
+        .is_some_and(|wlroots| wlroots.capabilities.data_control)
+    {
+        let offers = text_offers(&text);
+        return match tokio::task::spawn_blocking(move || compass_wayland::clipboard::set(offers))
+            .await
+        {
+            Ok(Ok(())) => Response::Ack,
+            Ok(Err(err)) => Response::Error(ProtocolError::new(
+                ErrorKind::Internal,
+                format!("{WHAT} failed: {err}"),
+            )),
+            Err(err) => Response::Error(ProtocolError::new(
+                ErrorKind::Internal,
+                format!("{WHAT} failed: {err}"),
+            )),
+        };
+    }
+    let Some(shell) = state.read().await.shell_client() else {
+        return Response::Error(crate::window_service::no_bus(WHAT));
+    };
+    match shell
+        .set_clipboard(&compass_shell::ClipboardContent::text(text))
+        .await
+    {
+        Ok(()) => Response::Ack,
+        Err(err) => Response::Error(crate::window_service::refusal(&err, WHAT)),
+    }
+}
+
+/// Text as data-control offers: UTF-8 under the types toolkits ask for, so
+/// GTK, Qt, terminals and X clients through Xwayland all find one.
+fn text_offers(text: &str) -> Vec<compass_wayland::data_control::Offer> {
+    ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"]
+        .into_iter()
+        .map(|mime_type| compass_wayland::data_control::Offer {
+            mime_type: mime_type.to_owned(),
+            data: text.as_bytes().to_vec(),
+        })
+        .collect()
+}
+
+/// Why clipboard history answers nothing: almost always a keyring that is
+/// missing or locked, which `compass doctor` explains.
+const CLIPBOARD_UNAVAILABLE: &str = "clipboard history is unavailable: Compass needs an unlocked \
+     keyring to keep it encrypted. Run compass doctor to see what is missing";
+
 fn clipboard_unavailable() -> Response {
     Response::Error(ProtocolError::new(
         ErrorKind::Unsupported,
-        "clipboard history is unavailable: no keyring, or the store would not open \
-         (the engine log says which)",
+        CLIPBOARD_UNAVAILABLE,
     ))
 }
 
@@ -1345,7 +1401,7 @@ async fn sync_keywords(state: &Arc<RwLock<EngineState>>) {
 async fn input_server(state: &Arc<RwLock<EngineState>>, enable: Option<bool>) -> Response {
     if let Some(enabled) = enable {
         let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut config = Config::load().unwrap_or_default();
+            let mut config = Config::load()?;
             config.input_server_mut().set_enabled(Some(enabled));
             config.save_to(compass_core::config::default_config_path()?)?;
             Ok(())
@@ -2054,6 +2110,7 @@ async fn run_extension_command(
             launches,
             deliver,
         )),
+        launcher: Some(launcher_window(state)),
     };
     let started = tokio::task::spawn_blocking(move || {
         crate::extension_runner::start(&runtime, &command, &data_dir, host)
@@ -2082,6 +2139,22 @@ async fn run_extension_command(
             format!("the extension task failed: {err}"),
         )),
     }
+}
+
+/// The launcher window, for a command's serving thread: it blocks that
+/// thread, never the engine's, until the window answers.
+fn launcher_window(state: &Arc<RwLock<EngineState>>) -> crate::extension_runner::Launcher {
+    let (state, handle) = (Arc::clone(state), tokio::runtime::Handle::current());
+    crate::extension_runner::Launcher(Arc::new(move |command| {
+        let state = Arc::clone(&state);
+        handle.block_on(async move {
+            let slot = state.read().await.window_slot();
+            matches!(
+                forward(&slot, command, "tell the launcher").await,
+                Response::Ack
+            )
+        })
+    }))
 }
 
 /// Hands the launch under `token` to the launcher window. Without a window,
@@ -2349,8 +2422,25 @@ async fn set_extension_preferences(
     }
 }
 
+/// Shortens how long an `ExtensionView` is held, in milliseconds, so a test
+/// can hold a view idle past a client's deadline without waiting the whole
+/// [`compass_ipc::EXTENSION_VIEW_HOLD`]. Never lengthens it: a client allows
+/// [`compass_ipc::long_poll_deadline`] of the constant, not of this.
+pub const VIEW_HOLD_ENV: &str = "COMPASS_EXTENSION_VIEW_HOLD_MS";
+
 /// How long an `ExtensionView` is held open waiting for a change.
-const VIEW_POLL: std::time::Duration = std::time::Duration::from_secs(20);
+fn view_hold() -> std::time::Duration {
+    static HOLD: std::sync::LazyLock<std::time::Duration> = std::sync::LazyLock::new(|| {
+        std::env::var(VIEW_HOLD_ENV)
+            .ok()
+            .and_then(|ms| ms.trim().parse().ok())
+            .map(std::time::Duration::from_millis)
+            .map_or(compass_ipc::EXTENSION_VIEW_HOLD, |hold| {
+                hold.min(compass_ipc::EXTENSION_VIEW_HOLD)
+            })
+    });
+    *HOLD
+}
 
 async fn extension_view(state: &Arc<RwLock<EngineState>>, session: u64, after: u64) -> Response {
     let watched = {
@@ -2367,7 +2457,7 @@ async fn extension_view(state: &Arc<RwLock<EngineState>>, session: u64, after: u
         ));
     };
     // A timeout is an answer too: the same version, so the launcher asks again.
-    let _ = tokio::time::timeout(VIEW_POLL, watch.wait_for(|view| view.version > after)).await;
+    let _ = tokio::time::timeout(view_hold(), watch.wait_for(|view| view.version > after)).await;
     let view = watch.borrow().clone();
     Response::ExtensionView {
         version: view.version,
@@ -2725,8 +2815,7 @@ pub async fn handle(state: &Arc<RwLock<EngineState>>, request: Request) -> Respo
             let Some(store) = state.read().await.clipboard.clone() else {
                 return Response::Error(ProtocolError::new(
                     ErrorKind::Unsupported,
-                    "clipboard history is unavailable: no keyring, or the store would not open \
-                     (the engine log says which)",
+                    CLIPBOARD_UNAVAILABLE,
                 ));
             };
             match tokio::task::spawn_blocking(move || store.content(&id)).await {
@@ -3065,26 +3154,18 @@ pub async fn handle(state: &Arc<RwLock<EngineState>>, request: Request) -> Respo
                 Err(message) => Response::Error(ProtocolError::new(ErrorKind::Internal, message)),
             }
         }
-        Request::StoreExtension {
-            store,
-            author,
-            name,
-        } => {
+        Request::StoreExtension { store, owner, name } => {
             let stores = Arc::clone(&state.read().await.stores);
-            match stores.detail(store, &author, &name).await {
+            match stores.detail(store, &owner, &name).await {
                 Ok(detail) => Response::StoreExtension { detail },
                 Err(message) => Response::Error(ProtocolError::new(ErrorKind::BadRequest, message)),
             }
         }
-        Request::StoreInstall {
-            store,
-            author,
-            name,
-        } => {
+        Request::StoreInstall { store, owner, name } => {
             let stores = Arc::clone(&state.read().await.stores);
             // A Raycast extension the overrides manifest replaces on Linux
             // installs its replacement instead.
-            let (store, author, name) = match (
+            let (store, owner, name) = match (
                 store,
                 compass_core::raycast_overrides::Manifest::shipped().raycast_redirect(&name),
             ) {
@@ -3101,9 +3182,9 @@ pub async fn handle(state: &Arc<RwLock<EngineState>>, request: Request) -> Respo
                         redirect.name.clone(),
                     )
                 }
-                _ => (store, author, name),
+                _ => (store, owner, name),
             };
-            match stores.install(store, &author, &name).await {
+            match stores.install(store, &owner, &name).await {
                 Ok((id, title)) => {
                     state.write().await.index.rescan_extensions();
                     Response::StoreInstalled { id, title }
@@ -3170,7 +3251,7 @@ pub async fn handle(state: &Arc<RwLock<EngineState>>, request: Request) -> Respo
                 ));
             }
             let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut config = Config::load().unwrap_or_default();
+                let mut config = Config::load()?;
                 config.set_font_family(&family);
                 config.save_to(compass_core::config::default_config_path()?)?;
                 Ok(())
@@ -3197,7 +3278,7 @@ pub async fn handle(state: &Arc<RwLock<EngineState>>, request: Request) -> Respo
                 ));
             };
             let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut config = Config::load().unwrap_or_default();
+                let mut config = Config::load()?;
                 config
                     .launcher_mut()
                     .appearance_mut()
@@ -3299,6 +3380,7 @@ pub async fn handle(state: &Arc<RwLock<EngineState>>, request: Request) -> Respo
             crate::paste::paste(state, compass_shell::ClipboardContent::text(text), WHAT).await
         }
         Request::PasteText { text } => paste_text(state, text).await,
+        Request::CopyText { text } => copy_text(state, text).await,
         Request::ExpandShortcut { id, arguments } => {
             match expand_shortcut(state, &id, &arguments).await {
                 Ok((_, expanded)) => Response::Text { text: expanded },
@@ -3513,8 +3595,7 @@ pub async fn handle(state: &Arc<RwLock<EngineState>>, request: Request) -> Respo
             let Some(store) = state.read().await.clipboard.clone() else {
                 return Response::Error(ProtocolError::new(
                     ErrorKind::Unsupported,
-                    "clipboard history is unavailable: no keyring, or the store would not open \
-                     (the engine log says which)",
+                    CLIPBOARD_UNAVAILABLE,
                 ));
             };
             let changed = tokio::task::spawn_blocking(move || match request {
@@ -3548,8 +3629,7 @@ pub async fn handle(state: &Arc<RwLock<EngineState>>, request: Request) -> Respo
             let Some(store) = store else {
                 return Response::Error(ProtocolError::new(
                     ErrorKind::Unsupported,
-                    "clipboard history is unavailable: no keyring, or the store would not open \
-                     (the engine log says which)",
+                    CLIPBOARD_UNAVAILABLE,
                 ));
             };
             let (mime_type, data) =
@@ -3691,6 +3771,8 @@ pub async fn run(socket: &SocketPath, hotkey: bool) -> Result<()> {
     tokio::spawn(crate::catalog_watch::watch_applications(Arc::clone(&state)));
     // An extension a developer builds into place.
     tokio::spawn(crate::catalog_watch::watch_extensions(Arc::clone(&state)));
+    // `compass.json` edited by hand or by `compass theme set`.
+    tokio::spawn(crate::config_watch::run(Arc::clone(&state)));
 
     // Snippet keyword expansion: the input server, when `input_server.enabled`.
     {
@@ -3712,9 +3794,18 @@ pub async fn run(socket: &SocketPath, hotkey: bool) -> Result<()> {
         tokio::spawn(async move {
             match compass_shell::ShellClient::connect_session().await {
                 Ok(client) => state.write().await.set_shell(Arc::new(client)),
-                Err(err) => {
-                    tracing::warn!(error = %err, "no session bus; window switching unavailable")
+                // Only GNOME switches windows through the Shell extension; the
+                // wlroots compositors and KWin list them without the bus.
+                Err(err)
+                    if compass_wayland::compositor::desktop_is_gnome(
+                        std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+                    ) =>
+                {
+                    tracing::warn!(error = %err,
+                        "no session bus, so the GNOME Shell extension cannot be reached; window switching is unavailable")
                 }
+                Err(err) => tracing::info!(error = %err,
+                    "no session bus; the GNOME Shell extension is not used on this desktop"),
             }
         });
     }

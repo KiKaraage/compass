@@ -209,12 +209,12 @@ fn all_requests() -> Vec<Request> {
         },
         Request::StoreExtension {
             store: compass_ipc::StoreKind::Vicinae,
-            author: "zoë".into(),
+            owner: "zoë".into(),
             name: "clock".into(),
         },
         Request::StoreInstall {
             store: compass_ipc::StoreKind::Vicinae,
-            author: "zoë".into(),
+            owner: "zoë".into(),
             name: "clock".into(),
         },
         Request::StoreUninstall {
@@ -452,6 +452,9 @@ fn all_requests() -> Vec<Request> {
             trigger: "ctrl+alt+é".into(),
         },
         Request::ExtensionAlertRemember { session: u64::MAX },
+        Request::CopyText {
+            text: "88.07 👍🏽 zoë".into(),
+        },
         Request::FsQuery {
             query: "résumé".into(),
             limit: 10_000,
@@ -499,6 +502,7 @@ fn store_entry() -> compass_ipc::StoreEntry {
         update_available: true,
         compat: Some(1),
         author_avatar: Some("https://example.com/zoë.png".into()),
+        owner: "zoe".into(),
     }
 }
 
@@ -1173,6 +1177,7 @@ fn request_variants_are_exhaustive() {
             | Request::RefreshExchangeRates
             | Request::ProbeShortcut { .. }
             | Request::ExtensionAlertRemember { .. }
+            | Request::CopyText { .. }
             | Request::WindowOutcome(_) => {}
         }
     }

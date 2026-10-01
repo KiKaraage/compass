@@ -3915,19 +3915,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/layershellev/layershellev-0.19.1.crate",
-        "sha256": "69fbd3ced50d91a5a118e3e00f49c72040ea6b48b78b159a3936104fc2632925",
-        "dest": "cargo/vendor/layershellev-0.19.1"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"69fbd3ced50d91a5a118e3e00f49c72040ea6b48b78b159a3936104fc2632925\", \"files\": {}}",
-        "dest": "cargo/vendor/layershellev-0.19.1",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/lazy_static/lazy_static-1.5.0.crate",
         "sha256": "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe",
         "dest": "cargo/vendor/lazy_static-1.5.0"
@@ -6645,6 +6632,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/serde_path_to_error/serde_path_to_error-0.1.20.crate",
+        "sha256": "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457",
+        "dest": "cargo/vendor/serde_path_to_error-0.1.20"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457\", \"files\": {}}",
+        "dest": "cargo/vendor/serde_path_to_error-0.1.20",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/serde_repr/serde_repr-0.1.21.crate",
         "sha256": "8d3b1629de253c70a0508c3899572da79ca359fdab27c7920ff00406df418906",
         "dest": "cargo/vendor/serde_repr-0.1.21"
@@ -6926,19 +6926,6 @@
         "type": "inline",
         "contents": "{\"package\": \"0512da38f5e2b31201a93524adb8d3136276fa4fe4aafab4e1f727a82b534cc0\", \"files\": {}}",
         "dest": "cargo/vendor/smithay-client-toolkit-0.20.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/smithay-clipboard/smithay-clipboard-0.7.3.crate",
-        "sha256": "71704c03f739f7745053bde45fa203a46c58d25bc5c4efba1d9a60e9dba81226",
-        "dest": "cargo/vendor/smithay-clipboard-0.7.3"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"71704c03f739f7745053bde45fa203a46c58d25bc5c4efba1d9a60e9dba81226\", \"files\": {}}",
-        "dest": "cargo/vendor/smithay-clipboard-0.7.3",
         "dest-filename": ".cargo-checksum.json"
     },
     {

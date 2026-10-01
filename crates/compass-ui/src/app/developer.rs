@@ -16,7 +16,7 @@ impl LauncherApp {
     /// Opens the Create Extension form.
     pub(super) fn open_create_extension(&mut self) -> Task<Message> {
         self.page = Page::Preferences(Box::new(developer_page::form()));
-        iced::widget::operation::focus_next()
+        Task::none()
     }
 
     /// Submits the Create Extension form. `None` when the form showing is
@@ -84,6 +84,9 @@ impl LauncherApp {
         let Page::Created(page) = &self.page else {
             return Task::none();
         };
+        if let Some(scroll) = crate::scroll::reading_key(key.as_ref()) {
+            return scroll;
+        }
         match key.as_ref() {
             Key::Named(Named::Escape) => self.update(Message::Back),
             Key::Named(Named::Enter) => {

@@ -17,6 +17,7 @@ pub mod cli;
 pub mod cli_commands;
 pub mod clipboard_service;
 pub mod config_cmd;
+pub mod config_watch;
 pub mod conformance;
 pub mod developer;
 pub mod dmenu;
@@ -55,6 +56,7 @@ pub mod snippet_expansion;
 pub mod snippets;
 pub mod spike;
 pub mod stores;
+pub mod supervise;
 pub mod tray_host;
 pub mod tray_icon;
 pub mod typography;
@@ -93,6 +95,16 @@ pub fn main() -> ExitCode {
     // engine migrates: every other command talks to one that already has.
     // Its log lines are replayed once tracing is up.
     let migrated = serving.then(compass_xdg::brand::migrate_legacy_install);
+    // A `vicinae.json` moved to `compass.json` still holds Vicinae's keys,
+    // which nothing here reads: they are translated as `settings.json` is.
+    let translated = serving
+        .then(|| {
+            let path = compass_core::config::default_config_path().ok()?;
+            Some(compass_core::config_migration::translate_file_in_place(
+                &path,
+            ))
+        })
+        .flatten();
     // The engine also writes its log to a file, for `compass logs`.
     let log_file = serving.then(logs::log_path).flatten().map(|path| {
         let log = logs::LogFile::pending(&path);
@@ -102,6 +114,17 @@ pub fn main() -> ExitCode {
     init_tracing(cli.verbose, log_file);
     for (base, migration) in migrated.iter().flatten() {
         compass_xdg::brand::log_migration(base, migration);
+    }
+    match translated {
+        Some(Ok(Some(migration))) => tracing::info!(
+            translated = migration.mapped.len(),
+            left_behind = ?migration.unmapped(),
+            "compass.json held Vicinae settings; translated them, and kept the original as compass.json.vicinae.bak"
+        ),
+        Some(Err(error)) => {
+            tracing::warn!(%error, "compass.json holds Vicinae settings that could not be translated");
+        }
+        _ => {}
     }
 
     match run(cli) {
@@ -130,7 +153,10 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     // started on, and on Wayland that has to be the process's main thread —
     // so the launcher cannot be dispatched from inside `block_on` like every
     // other command. ADR-0011 records what this costs and what it defers.
-    if matches!(cli.command, Command::Ui | Command::Start { .. }) {
+    if matches!(
+        cli.command,
+        Command::Ui | Command::Start { .. } | Command::LauncherChild { .. }
+    ) {
         require_servable_engine(cli.engine)?;
         // Checked here rather than left to Iced. With no display, `iced::run`
         // does not return an error — winit panics inside it, and the user gets
@@ -146,9 +172,19 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
                  nothing to open a window on. Run `compass doctor` for the full picture"
             );
         }
-        let _ui_lease = match ui_instance::acquire(cli.socket_path().as_path())
-            .context("claiming the resident launcher instance")?
-        {
+        // A child of `start` runs under its parent's lease and engine.
+        let child = matches!(cli.command, Command::LauncherChild { .. });
+        if child {
+            supervise::watch_parent();
+        }
+        let acquired = if child {
+            Some(None)
+        } else {
+            ui_instance::acquire(cli.socket_path().as_path())
+                .context("claiming the resident launcher instance")?
+                .map(Some)
+        };
+        let _ui_lease = match acquired {
             Some(lease) => lease,
             None => {
                 if matches!(cli.command, Command::Start { hidden: true }) {
@@ -170,7 +206,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             }
         };
 
-        let _engine_session = if matches!(cli.command, Command::Start { .. }) {
+        let engine_session = if matches!(cli.command, Command::Start { .. }) {
             let mut command = std::process::Command::new(std::env::current_exe()?);
             command
                 .arg("--engine=rust")
@@ -190,13 +226,20 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             None
         };
 
+        // `start` runs the launcher as a child and starts it again when it
+        // fails, so a launcher that loses its compositor connection does not
+        // take the engine, and every other window, down with it.
+        if let (Command::Start { hidden }, Some(engine)) = (&cli.command, engine_session) {
+            return supervise::run(&cli, *hidden, engine);
+        }
+
         // Attached before Iced starts, on a thread that still belongs to us.
         // `None` means no engine is listening, which leaves the launcher
         // running undriven rather than refusing to start -- `compass ui` by
         // hand is a supported way to use it.
         let link = window::attach(cli.socket_path().as_path())
             .context("attaching the launcher window to the engine")?;
-        if link.is_none() && matches!(cli.command, Command::Start { .. }) {
+        if link.is_none() && matches!(cli.command, Command::LauncherChild { .. }) {
             bail!("the Compass engine stopped before the launcher could attach");
         }
         if link.is_none() {
@@ -256,9 +299,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
                     emoji_skin_tone(&config),
                     emoji_default_action(&config),
                     clock(&config),
-                    compass_core::favicon::Service::from_config(
-                        config.unknown_fields().get("favicon_service"),
-                    ),
+                    compass_core::favicon::Service::from_config(config.favicon_service()),
                     config.launcher().close_on_focus_loss(),
                     config.launcher().hotkey().to_owned(),
                 )
@@ -335,7 +376,32 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             .map(|d| d as std::sync::Arc<dyn compass_ui::backend::ClipboardBackend>);
         let windows = daemon.map(|d| d as std::sync::Arc<dyn compass_ui::backend::WindowBackend>);
 
+        // Hand edits and `compass theme set` reach the window without a
+        // restart. A file that does not parse is skipped: the window keeps
+        // what it has, and the engine's log says why.
+        let config_path = compass_core::config::default_config_path().ok();
+        let (config_link, _config_watch) = match &config_path {
+            Some(path) => {
+                let (link, sender) = compass_ui::config_link::ConfigLink::new();
+                let watched = path.clone();
+                match config_watch::watch(path, move || {
+                    let _ = compass_ui::theme::load_default_user_themes();
+                    if let Ok(config) = compass_core::Config::load_from(&watched) {
+                        let _ = sender.send(std::sync::Arc::new(config));
+                    }
+                }) {
+                    Ok(watch) => (Some(link), Some(watch)),
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot watch compass.json; changes to it apply at the next start");
+                        (None, None)
+                    }
+                }
+            }
+            None => (None, None),
+        };
+
         let flags = compass_ui::AppFlags {
+            config_link,
             theme: theme_choice,
             launcher: std::sync::Arc::new(compass_platform_linux::LinuxLauncher),
             backend,
@@ -343,13 +409,18 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             windows,
             root_config,
             link,
-            exit_on_engine_disconnect: matches!(cli.command, Command::Start { .. }),
-            start_hidden: matches!(cli.command, Command::Start { hidden: true }),
+            exit_on_engine_disconnect: matches!(cli.command, Command::LauncherChild { .. }),
+            start_hidden: matches!(cli.command, Command::LauncherChild { hidden: true }),
             keybinding,
             wrap_navigation,
             quick_launch,
             close_on_focus_loss,
+            pop_to_root_on_close: compass_core::Config::load()
+                .map(|config| config.launcher().pop_to_root_on_close())
+                .unwrap_or(compass_core::config::DEFAULT_POP_TO_ROOT_ON_CLOSE),
             launcher_hotkey,
+            hotkey_compositor: compass_core::hotkey_guide::Compositor::from_env(),
+            flatpak: compass_core::hotkey_guide::in_flatpak(),
             icons: appearance_preset.icons,
             appearance_preset,
             started_at: Some(started_at),
@@ -383,11 +454,11 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             compass_wayland::SurfaceKind::LayerShell => {
                 tracing::info!("presenting the launcher as a wlr-layer-shell surface");
                 compass_ui::run_resident_layer_shell(flags, layer_shell_connection())
-                    .map_err(|err| anyhow::anyhow!("the launcher could not start: {err}"))?;
+                    .map_err(anyhow::Error::from)?;
             }
             compass_wayland::SurfaceKind::XdgToplevel => {
                 compass_ui::run_resident(flags, Some(window_material::for_launcher()))
-                    .map_err(|err| anyhow::anyhow!("the launcher could not start: {err}"))?;
+                    .map_err(anyhow::Error::from)?;
             }
         }
         return Ok(ExitCode::from(EXIT_OK));
@@ -415,7 +486,15 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
 fn onboarding_due() -> Option<std::path::PathBuf> {
     use compass_core::onboarding;
     let disabled = onboarding::disabled_by(std::env::var_os(onboarding::DISABLE_ENV).as_deref());
-    onboarding::default_path().filter(|path| onboarding::should_show(path, disabled))
+    let path = onboarding::default_path().filter(|path| onboarding::should_show(path, disabled))?;
+    let migrated = compass_core::xdg_dirs::config_home()
+        .is_some_and(|home| onboarding::came_from_vicinae(&home));
+    if migrated {
+        tracing::info!("settings carried over from Vicinae; skipping the first-run setup");
+        let _ = onboarding::mark_completed(&path, &jiff::Timestamp::now().to_string());
+        return None;
+    }
+    Some(path)
 }
 
 /// Whether each power command asks first, from its `confirm` preference
@@ -585,14 +664,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
 
         Command::Deeplink { url } => {
-            // The OAuth redirect and the store's extensions links; every other
-            // deeplink the C++ takes (themes, commands) is refused by name
-            // rather than silently dropped.
+            // The OAuth redirect, then everything the engine opens; any other
+            // deeplink is refused by name rather than silently dropped.
             if compass_worker_host::oauth_service::Redirect::parse(&url).is_ok() {
                 ipc::send_ack(&socket, compass_ipc::Request::OAuthRedirect { url }).await?;
                 return Ok(ExitCode::from(EXIT_OK));
             }
-            if compass_core::settings_catalog::parse_settings_link(&url).is_some() {
+            // What the engine's OpenDeeplink takes: a launch link
+            // (`compass://launch/<provider>/<entrypoint>`), a settings link
+            // and a store link, so the CLI refuses nothing the engine opens.
+            if compass_core::root_items::parse_launch_link(&url).is_some()
+                || compass_core::settings_catalog::parse_settings_link(&url).is_some()
+            {
                 ipc::send_ack(&socket, compass_ipc::Request::OpenDeeplink { url }).await?;
                 return Ok(ExitCode::from(EXIT_OK));
             }
@@ -681,7 +764,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Config(config_cmd) => config_cmd::run(config_cmd),
 
         // Handled in `run`, before the runtime exists.
-        Command::Ui | Command::Start { .. } => {
+        Command::Ui | Command::Start { .. } | Command::LauncherChild { .. } => {
             unreachable!("the launcher is dispatched before the runtime")
         }
 
@@ -742,7 +825,8 @@ async fn handle_input_server(
             // No engine: the setting still belongs in compass.json, and the
             // next engine reads it.
             tracing::debug!(%error, "no engine to apply input_server.enabled to");
-            let mut config = compass_core::Config::load().unwrap_or_default();
+            let mut config = compass_core::Config::load()
+                .context("compass.json cannot be read, so it was left unchanged")?;
             config.input_server_mut().set_enabled(Some(enable));
             config.save_to(compass_core::config::default_config_path()?)?;
             println!(
@@ -805,7 +889,8 @@ async fn handle_theme(cmd: crate::cli::ThemeCommand) -> Result<ExitCode> {
             let parsed = compass_ui::theme::Theme::from_name(&theme).ok_or_else(|| {
                 anyhow::anyhow!("unknown theme {theme:?}; try `compass theme list`")
             })?;
-            let mut config = compass_core::Config::load().unwrap_or_default();
+            let mut config = compass_core::Config::load()
+                .context("compass.json cannot be read, so it was left unchanged")?;
             config
                 .launcher_mut()
                 .appearance_mut()
@@ -815,7 +900,8 @@ async fn handle_theme(cmd: crate::cli::ThemeCommand) -> Result<ExitCode> {
             Ok(ExitCode::from(EXIT_OK))
         }
         ThemeCommand::Reset => {
-            let mut config = compass_core::Config::load().unwrap_or_default();
+            let mut config = compass_core::Config::load()
+                .context("compass.json cannot be read, so it was left unchanged")?;
             config.launcher_mut().appearance_mut().set_theme(None);
             config.save_to(compass_core::config::default_config_path()?)?;
             println!("theme reset to system");
@@ -841,8 +927,28 @@ async fn window_command(
     request: Request,
 ) -> Result<ExitCode> {
     require_servable_engine(engine)?;
-    ipc::send_ack(socket, request).await?;
+    send_window_command(socket, request, WINDOW_COMMAND_TIMEOUT).await?;
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// How long `toggle`, `show` and `hide` wait for the launcher. Summoning a
+/// cold launcher takes well under a second; a launcher that has not answered
+/// in this long is stuck, and a command bound to a key must not hang with it.
+const WINDOW_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn send_window_command(
+    socket: &compass_ipc::SocketPath,
+    request: Request,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    match tokio::time::timeout(timeout, ipc::send_ack(socket, request)).await {
+        Ok(answer) => answer,
+        Err(_) => bail!(
+            "the launcher did not answer within {} seconds. It may be stuck; if it stays \
+             that way, quit Compass and start it again",
+            timeout.as_secs()
+        ),
+    }
 }
 
 /// Renders query hits for a terminal.
@@ -1037,5 +1143,31 @@ mod tests {
         assert!(text.contains("cannot dispatch"));
         assert!(text.contains("--engine rust"));
         assert!(text.contains("doctor"));
+    }
+
+    #[tokio::test]
+    async fn a_window_command_to_a_stuck_launcher_times_out_and_says_so() {
+        // An engine that takes the request and never answers, as one did
+        // while its launcher waited on a surface the compositor had closed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ipc.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let held = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        let socket = compass_ipc::SocketPath::exact(path);
+        let started = std::time::Instant::now();
+        let err = send_window_command(
+            &socket,
+            Request::Toggle,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect_err("a launcher that never answers is an error");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(err.to_string().contains("did not answer"), "{err}");
+        held.abort();
     }
 }

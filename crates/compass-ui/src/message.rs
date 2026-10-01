@@ -61,6 +61,14 @@ pub enum Message {
     /// The engine armed a paste of the selected entry, or could not; on a
     /// refusal the entry is copied instead.
     ClipboardPasted(Result<(), String>),
+    /// The engine put text on its clipboard, or could not; on a refusal the
+    /// window copies it itself.
+    TextCopied {
+        /// What was copied.
+        text: String,
+        /// The engine's answer.
+        result: Result<(), String>,
+    },
     /// The engine pasted a glyph from the emoji picker, or could not; on a
     /// refusal the glyph is copied instead.
     EmojiPasted {
@@ -322,7 +330,7 @@ pub enum Message {
     ExtensionSubtitlesLoaded(Result<Vec<(String, String)>, String>),
     /// The engine's answer to whether a newer Compass release is out.
     UpdateStatusLoaded(Result<Option<crate::backend::UpdateOffer>, String>),
-    /// "Skip This Version" finished for the tag.
+    /// "Skip this version" finished for the tag.
     UpdateSkipped(String, Result<(), String>),
     /// A command's preferences form arrived, to edit without running it.
     PreferencesOpened {
@@ -466,6 +474,8 @@ pub enum Message {
     AppearanceChanged(crate::design::Appearance),
     /// The desktop's interface font family changed.
     TypographyChanged(String),
+    /// `compass.json` changed on disk and was read again.
+    ConfigReloaded(std::sync::Arc<compass_core::Config>),
     /// Preview a theme without persisting it (#153 live preview).
     ThemePreview(crate::theme::Theme),
     /// Commit the previewed theme to config.
@@ -496,6 +506,21 @@ pub enum Message {
     /// translucency or corner radius changed. Where the blur goes (see
     /// `crate::material`).
     CardMeasured(iced::Size),
+    /// A window was opened (`opened`) or resized to this logical size.
+    WindowSized {
+        /// The window.
+        id: iced::window::Id,
+        /// Its size, logical pixels.
+        size: iced::Size,
+        /// Whether this is its first size, from the compositor's first
+        /// configure.
+        opened: bool,
+    },
+    /// The logical size of the monitor a toplevel is on, when the toolkit
+    /// knows it.
+    MonitorSized(iced::window::Id, Option<iced::Size>),
+    /// A click landed on the backdrop, outside the launcher.
+    BackdropPressed,
     /// Leave for good.
     ///
     /// The one thing that still ends the process, now that dismissing only

@@ -134,7 +134,7 @@ fn a_root_rows_open_preferences_opens_the_settings_at_its_provider() {
     let row = app
         .panel
         .as_ref()
-        .and_then(|panel| panel.row_titled("Open Preferences"))
+        .and_then(|panel| panel.row_titled("Open preferences"))
         .expect("the panel offers the preferences");
     let task = app.update(Message::PanelClicked(row));
     settle(&mut app, task);
@@ -476,4 +476,352 @@ fn with_an_engine_the_engine_writes_and_a_theme_is_kept_or_put_back() {
             "the engine writes the file, not the window"
         );
     }
+}
+
+fn press(app: &mut LauncherApp, named: Named, modifiers: Modifiers) {
+    let task = app.update(key(Key::Named(named), modifiers));
+    settle(app, task);
+}
+
+/// Tabs until `target` has the keyboard, failing if it never does.
+fn tab_to(app: &mut LauncherApp, target: &Control) {
+    for _ in 0..200 {
+        if page(app).focused.as_ref() == Some(target) {
+            return;
+        }
+        press(app, Named::Tab, Modifiers::empty());
+    }
+    panic!("Tab never reached {target:?}");
+}
+
+#[test]
+fn tab_reaches_every_control_on_every_page_in_order_and_comes_back_to_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    let _ = app.open_settings(None);
+    let rows: Vec<(usize, String)> = page(&app)
+        .sidebar
+        .rows()
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.selectable())
+        .map(|(at, row)| (at, row.key.clone()))
+        .collect();
+    let mut kinds = std::collections::BTreeSet::new();
+    for (row, key) in rows {
+        send(&mut app, SettingsMessage::SidebarSelected(row));
+        let controls = page(&app).controls(None);
+        let mut reached = Vec::new();
+        for _ in 0..controls.len() {
+            press(&mut app, Named::Tab, Modifiers::empty());
+            reached.push(page(&app).focused.clone().expect("a control"));
+        }
+        assert_eq!(reached, controls, "{key}: Tab walks the controls as drawn");
+        press(&mut app, Named::Tab, Modifiers::empty());
+        assert_eq!(page(&app).focused, None, "{key}: then the search field");
+        if let Some(last) = controls.last() {
+            press(&mut app, Named::Tab, Modifiers::SHIFT);
+            assert_eq!(page(&app).focused.as_ref(), Some(last), "{key}: Shift+Tab");
+            press(&mut app, Named::Escape, Modifiers::empty());
+            assert_eq!(page(&app).focused, None, "{key}: Escape gives it back");
+        }
+        for control in controls {
+            kinds.insert(match control {
+                Control::Setting(key) => match settings_catalog::find(&key).unwrap().kind {
+                    Kind::Toggle => "switch",
+                    Kind::Choice(_) | Kind::Theme => "dropdown",
+                    Kind::Shortcut => "hotkey",
+                    _ => "field",
+                },
+                Control::ProviderSwitch(_) | Control::ItemSwitch(_) => "switch",
+                Control::ItemAlias(_) => "field",
+                Control::ItemShortcut(_) => "record shortcut",
+                Control::ItemPreferences(_) => "preferences",
+                Control::Link(_) => "link",
+            });
+        }
+    }
+    for kind in [
+        "switch",
+        "dropdown",
+        "hotkey",
+        "field",
+        "record shortcut",
+        "link",
+    ] {
+        assert!(kinds.contains(kind), "no {kind} was reached: {kinds:?}");
+    }
+}
+
+#[test]
+fn space_and_enter_work_each_kind_of_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    let _ = app.open_settings(None);
+
+    // A switch.
+    let close = Control::Setting("launcher.close_on_focus_loss".into());
+    tab_to(&mut app, &close);
+    let before = saved_or_default(&app).launcher().close_on_focus_loss();
+    press(&mut app, Named::Space, Modifiers::empty());
+    assert_eq!(saved(&app).launcher().close_on_focus_loss(), !before);
+    press(&mut app, Named::Enter, Modifiers::empty());
+    assert_eq!(saved(&app).launcher().close_on_focus_loss(), before);
+
+    // The hotkey's button starts the recorder.
+    press(&mut app, Named::Escape, Modifiers::empty());
+    tab_to(&mut app, &Control::Setting("launcher.hotkey".into()));
+    press(&mut app, Named::Enter, Modifiers::empty());
+    assert!(page(&app).recorder.is_some());
+    press(&mut app, Named::Escape, Modifiers::empty());
+    assert!(page(&app).recorder.is_none());
+    assert_eq!(
+        page(&app).focused,
+        Some(Control::Setting("launcher.hotkey".into())),
+        "the keyboard is back on the button"
+    );
+
+    // A dropdown opens, the arrows move through it, Enter picks.
+    select(&mut app, "appearance");
+    let scheme = Control::Setting("launcher.appearance.color_scheme".into());
+    tab_to(&mut app, &scheme);
+    press(&mut app, Named::Space, Modifiers::empty());
+    let opened = page(&app).menu.expect("the dropdown opened");
+    let (_, options) = page(&app).focused_choice().unwrap();
+    let wanted = if opened + 1 < options.len() {
+        press(&mut app, Named::ArrowDown, Modifiers::empty());
+        opened + 1
+    } else {
+        press(&mut app, Named::ArrowUp, Modifiers::empty());
+        opened - 1
+    };
+    assert_eq!(page(&app).menu, Some(wanted));
+    press(&mut app, Named::Enter, Modifiers::empty());
+    assert_eq!(page(&app).menu, None);
+    assert_eq!(
+        saved(&app).launcher().appearance().color_scheme(),
+        options[wanted].0
+    );
+    // Escape closes an open dropdown without choosing.
+    press(&mut app, Named::Enter, Modifiers::empty());
+    assert!(page(&app).menu.is_some());
+    press(&mut app, Named::Escape, Modifiers::empty());
+    assert_eq!(page(&app).menu, None);
+    assert_eq!(page(&app).focused.as_ref(), Some(&scheme));
+
+    // A provider's switch and an item's.
+    select(&mut app, "applications");
+    tab_to(&mut app, &Control::ProviderSwitch("applications".into()));
+    press(&mut app, Named::Space, Modifiers::empty());
+    assert!(
+        !page(&app)
+            .providers
+            .iter()
+            .any(|p| p.id == "applications" && p.enabled)
+    );
+    let item = page(&app)
+        .providers
+        .iter()
+        .find(|p| p.id == "applications")
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    tab_to(&mut app, &Control::ItemSwitch(item.clone()));
+    press(&mut app, Named::Space, Modifiers::empty());
+    let item_on = |app: &LauncherApp| {
+        page(app)
+            .providers
+            .iter()
+            .flat_map(|p| &p.items)
+            .find(|i| i.id == item)
+            .unwrap()
+            .enabled
+    };
+    assert!(!item_on(&app));
+    tab_to(&mut app, &Control::ItemShortcut(item.clone()));
+    press(&mut app, Named::Space, Modifiers::empty());
+    assert!(page(&app).recorder.is_some());
+    press(&mut app, Named::Escape, Modifiers::empty());
+
+    // Escape, with nothing focused, leaves.
+    press(&mut app, Named::Escape, Modifiers::empty());
+    press(&mut app, Named::Escape, Modifiers::empty());
+    assert!(matches!(app.page, Page::Root));
+}
+
+#[test]
+fn page_keys_and_space_in_the_search_field_do_not_change_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    let _ = app.open_settings(None);
+    for named in [
+        Named::PageDown,
+        Named::PageUp,
+        Named::Home,
+        Named::End,
+        Named::Space,
+    ] {
+        press(&mut app, named, Modifiers::empty());
+        assert_eq!(page(&app).focused, None);
+        assert_eq!(page(&app).shown(), Shown::Core(CorePage::General));
+    }
+    assert!(
+        !dir.path().join("compass.json").exists(),
+        "nothing was written"
+    );
+}
+
+fn saved_or_default(app: &LauncherApp) -> compass_core::Config {
+    compass_core::Config::load_from(app.config_path.as_ref().unwrap()).unwrap_or_default()
+}
+
+#[test]
+fn a_refused_write_puts_the_switch_back_and_says_why_in_the_error_colour() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    // Nothing can be written under a path whose parent is a file.
+    std::fs::write(dir.path().join("blocker"), "").unwrap();
+    app.config_path = Some(dir.path().join("blocker").join("compass.json"));
+    let _ = app.open_settings(None);
+    let setting = settings_catalog::find("launcher.close_on_focus_loss").unwrap();
+    assert_eq!(page(&app).value(&setting), json!(false));
+
+    send(
+        &mut app,
+        SettingsMessage::Changed("launcher.close_on_focus_loss".into(), json!(true)),
+    );
+    assert_eq!(
+        page(&app).value(&setting),
+        json!(false),
+        "the switch shows what the file still says"
+    );
+    assert!(
+        page(&app)
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("could not save")),
+        "{:?}",
+        page(&app).notice
+    );
+    let palette = app.palette();
+    assert_ne!(palette.error(), palette.accent, "not drawn as a link");
+}
+
+#[test]
+fn a_file_with_a_typo_opens_with_the_problem_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    std::fs::write(
+        dir.path().join("compass.json"),
+        r#"{"launcher": {"close_on_focus_los": true, "max_results": 7}}"#,
+    )
+    .unwrap();
+    let _ = app.open_settings(None);
+    let notice = page(&app).notice.clone().unwrap_or_default();
+    assert!(
+        notice.contains("Did you mean launcher.close_on_focus_loss?"),
+        "{notice}"
+    );
+    let max = settings_catalog::find("launcher.max_results").unwrap();
+    assert_eq!(
+        page(&app).value(&max),
+        json!(7),
+        "the rest of the file is read"
+    );
+}
+
+#[test]
+fn a_reloaded_file_reaches_the_window_and_an_open_settings_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    let _ = app.open_settings(None);
+    let config = compass_core::Config::parse(
+        r#"{"launcher": {"wrap_navigation": true, "keybinding": "emacs",
+            "appearance": {"theme": "dracula", "preset": "rofi"}}}"#,
+        std::path::Path::new("compass.json"),
+    )
+    .unwrap();
+    let task = app.update(Message::ConfigReloaded(Arc::new(config)));
+    settle(&mut app, task);
+    assert!(app.wrap_navigation);
+    assert_eq!(app.keybinding, compass_core::keybinding::Scheme::Emacs);
+    assert_eq!(app.theme_choice, crate::theme::Theme::Dracula);
+    let wrap = settings_catalog::find("launcher.wrap_navigation").unwrap();
+    assert_eq!(page(&app).value(&wrap), json!(true));
+}
+
+#[test]
+fn clear_the_search_on_close_empties_the_query_only_when_it_is_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    let _ = app.update(Message::QueryChanged("fire".into()));
+    let _ = app.conceal();
+    assert_eq!(app.query, "fire", "off, as in Vicinae: the search is kept");
+
+    let config = compass_core::Config::parse(
+        r#"{"launcher": {"pop_to_root_on_close": true}}"#,
+        std::path::Path::new("compass.json"),
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigReloaded(Arc::new(config)));
+    let _ = app.conceal();
+    assert_eq!(app.query, "", "on: the next summon starts empty");
+}
+
+#[test]
+fn an_item_the_search_lists_is_not_offered_again_as_a_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    app.fallbacks = vec![compass_core::commands::SEARCH_FILES_FALLBACK_ID.to_owned()];
+    let _ = app.update(Message::QueryChanged("docs".into()));
+    let search_files = app
+        .results
+        .iter()
+        .filter(|row| match row {
+            crate::app::RootRow::Command(command) => command.entrypoint == "search-files",
+            crate::app::RootRow::Fallback(crate::app::Fallback::Command(command)) => {
+                command.entrypoint == "search-files"
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(search_files, 1, "{}", app.state_line());
+
+    // A query that does not find it still offers it as the fallback.
+    let _ = app.update(Message::QueryChanged("quarterly".into()));
+    assert!(
+        app.results
+            .iter()
+            .any(|row| matches!(row, crate::app::RootRow::Fallback(_)))
+    );
+}
+
+#[test]
+fn hibernate_does_not_answer_store() {
+    let hibernate = compass_core::power_commands::command("hibernate").unwrap();
+    assert!(!hibernate.description.to_lowercase().contains("store"));
+}
+
+#[test]
+fn the_hotkey_guidance_names_the_compositor_line_and_the_flatpak_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path());
+    assert!(
+        app.open_hint()
+            .starts_with("Press Super+Space to open Compass"),
+        "{}",
+        app.open_hint()
+    );
+    app.hotkey_compositor = Some(compass_core::hotkey_guide::Compositor::Sway);
+    app.flatpak = true;
+    assert!(
+        app.open_hint()
+            .contains("`bindsym $mod+space exec flatpak run org.tunaos.compass toggle`"),
+        "{}",
+        app.open_hint()
+    );
+    // The settings view draws the row as guidance, not as a recorder.
+    let _ = app.open_settings(None);
+    let _ = app.view();
 }

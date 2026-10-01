@@ -62,6 +62,24 @@ pub fn should_show(path: &Path, disabled: bool) -> bool {
     !disabled && completed_version(path) < VERSION
 }
 
+/// Whether `config_home` holds a Vicinae setup that Compass carried over:
+/// the `vicinae` directory (or the symlink the move leaves behind), or
+/// Vicinae's `settings.json` in Compass's directory.
+///
+/// Someone coming from Vicinae already has a launcher set up the way they
+/// like it, so the first-run flow is not shown to them.
+#[must_use]
+pub fn came_from_vicinae(config_home: &Path) -> bool {
+    config_home
+        .join(compass_xdg::brand::LEGACY_DIR_NAME)
+        .symlink_metadata()
+        .is_ok()
+        || config_home
+            .join(compass_xdg::brand::DIR_NAME)
+            .join("settings.json")
+            .is_file()
+}
+
 /// Whether [`DISABLE_ENV`]'s value turns the flow off.
 #[must_use]
 pub fn disabled_by(value: Option<&std::ffi::OsStr>) -> bool {
@@ -127,10 +145,8 @@ impl Step {
             Self::Extensions => {
                 "A few to start with. Find more in the Extension Store at any time."
             }
-            Self::Complete if shortcuts => "Compass is running. Open the launcher with:",
-            Self::Complete => {
-                "Compass is running. Bind a key to \"compass toggle\" to open it from anywhere."
-            }
+            Self::Complete if shortcuts => "Compass is ready. Open the launcher with:",
+            Self::Complete => "Compass is ready. Finish opens the launcher.",
         }
     }
 }
@@ -244,8 +260,8 @@ pub const GITHUB_URL: &str = crate::tray::PROJECT_URL;
 pub struct Recommendation {
     /// The store it comes from.
     pub store: Store,
-    /// Its author's handle in that store.
-    pub author: &'static str,
+    /// The handle that store files it under (its owner's).
+    pub owner: &'static str,
     /// Its name in that store.
     pub name: &'static str,
     /// Its title, as the store lists it.
@@ -265,43 +281,60 @@ impl Recommendation {
 /// The extensions the extensions step offers.
 ///
 /// Each one is general enough for a new user on any Linux desktop, needs no
-/// account, and Suite 1 (`scripts/suite1/expected.json`) shows its first
-/// command rendering.
+/// account or API key, and Suite 1 (`scripts/suite1/expected.json`) shows its
+/// first command rendering. The Raycast ones come first, because running
+/// Raycast store extensions on Linux is what Compass adds; none of them runs
+/// AppleScript or needs Homebrew, so they work without the runtime's shim
+/// having to stand in for macOS.
 pub const RECOMMENDED_EXTENSIONS: &[Recommendation] = &[
     Recommendation {
+        store: Store::Raycast,
+        owner: "gebeto",
+        name: "translate",
+        title: "Google Translate",
+        description: "Translate text between languages.",
+    },
+    Recommendation {
+        store: Store::Raycast,
+        owner: "mblode",
+        name: "google-search",
+        title: "Google Search",
+        description: "Search Google with suggestions as you type.",
+    },
+    Recommendation {
+        store: Store::Raycast,
+        owner: "josephschmitt",
+        name: "gif-search",
+        title: "GIF Search",
+        description: "Find animated GIFs and copy them.",
+    },
+    Recommendation {
+        store: Store::Raycast,
+        owner: "vimtor",
+        name: "tailwindcss",
+        title: "Tailwind CSS",
+        description: "Search the Tailwind CSS documentation.",
+    },
+    Recommendation {
         store: Store::Vicinae,
-        author: "gelei",
+        owner: "gelei",
         name: "bluetooth",
         title: "Bluetooth",
         description: "Connect and manage Bluetooth devices.",
     },
     Recommendation {
         store: Store::Vicinae,
-        author: "dagimg-dot",
+        owner: "dagimg-dot",
         name: "wifi-commander",
         title: "Wifi Commander",
         description: "Connect to Wi-Fi networks and manage saved ones.",
     },
     Recommendation {
         store: Store::Vicinae,
-        author: "leonkohli",
-        name: "process-manager",
-        title: "Process Manager",
-        description: "Find running processes and stop them.",
-    },
-    Recommendation {
-        store: Store::Vicinae,
-        author: "fbosch",
+        owner: "fbosch",
         name: "flathub-search",
         title: "Flathub",
         description: "Search Flathub for applications.",
-    },
-    Recommendation {
-        store: Store::Raycast,
-        author: "gebeto",
-        name: "translate",
-        title: "Google Translate",
-        description: "Translate text between languages.",
     },
 ];
 
@@ -426,6 +459,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_home_carried_over_from_vicinae_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!came_from_vicinae(dir.path()), "a fresh home");
+        std::fs::create_dir_all(dir.path().join("compass")).unwrap();
+        std::fs::write(dir.path().join("compass/compass.json"), "{}").unwrap();
+        assert!(
+            !came_from_vicinae(dir.path()),
+            "Compass's own file is not Vicinae's"
+        );
+        std::fs::write(dir.path().join("compass/settings.json"), "{}").unwrap();
+        assert!(came_from_vicinae(dir.path()));
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join("vicinae")).unwrap();
+        assert!(came_from_vicinae(other.path()), "not moved yet");
+    }
+
+    #[test]
     fn it_is_due_until_the_current_version_is_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("compass").join(FILE_NAME);
@@ -508,18 +558,21 @@ mod tests {
     }
 
     #[test]
-    fn the_last_step_says_how_to_open_the_launcher() {
-        assert!(Step::Complete.subtitle(false).contains("compass toggle"));
+    fn the_last_step_says_what_finish_does() {
+        assert_eq!(
+            Step::Complete.subtitle(false),
+            "Compass is ready. Finish opens the launcher."
+        );
         assert_eq!(
             Step::Complete.subtitle(true),
-            "Compass is running. Open the launcher with:"
+            "Compass is ready. Open the launcher with:"
         );
     }
 
     #[test]
     fn the_recommendations_are_installable_store_extensions() {
         assert!(
-            (3..=6).contains(&RECOMMENDED_EXTENSIONS.len()),
+            (6..=8).contains(&RECOMMENDED_EXTENSIONS.len()),
             "a short list"
         );
         let mut ids = std::collections::HashSet::new();
@@ -530,7 +583,7 @@ mod tests {
                 "{id} is not an id Compass installs"
             );
             assert!(ids.insert(id.clone()), "{id} is recommended twice");
-            assert!(!recommendation.author.is_empty() && !recommendation.title.is_empty());
+            assert!(!recommendation.owner.is_empty() && !recommendation.title.is_empty());
             assert!(
                 recommendation.description.ends_with('.'),
                 "{id}: a whole sentence"
@@ -558,6 +611,53 @@ mod tests {
                 .filter_map(|(_, value)| value["verdict"].as_str())
                 .collect();
             assert_eq!(verdicts, ["rendered"], "{id}");
+        }
+    }
+
+    /// Both stores are recommended, each row by the author Suite 1 installed
+    /// it from, so Install fetches the build that was seen rendering.
+    #[test]
+    fn suite_1_installed_every_recommendation_from_its_store_and_author() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/suite1/corpus.json"
+        );
+        let corpus: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for store in [Store::Raycast, Store::Vicinae] {
+            let recommended: Vec<_> = RECOMMENDED_EXTENSIONS
+                .iter()
+                .filter(|recommendation| recommendation.store == store)
+                .collect();
+            assert!(
+                recommended.len() >= 3,
+                "{} has {} recommendations",
+                store.name(),
+                recommended.len()
+            );
+            let listed = corpus[store.key()].as_array().unwrap();
+            for recommendation in recommended {
+                // A redirected extension installs under another id, and the
+                // step would never see it installed.
+                assert!(
+                    store != Store::Raycast
+                        || crate::raycast_overrides::Manifest::shipped()
+                            .raycast_redirect(recommendation.name)
+                            .is_none(),
+                    "{} is redirected on Linux",
+                    recommendation.name
+                );
+                assert!(
+                    listed.iter().any(|entry| {
+                        entry["name"] == recommendation.name
+                            && entry["author"] == recommendation.owner
+                    }),
+                    "{} {}/{} is not in Suite 1's corpus",
+                    store.name(),
+                    recommendation.owner,
+                    recommendation.name
+                );
+            }
         }
     }
 

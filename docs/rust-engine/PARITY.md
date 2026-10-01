@@ -605,6 +605,7 @@ What differs, by row:
 | `builtins/root` | The provider view carries the provider's icon as its navigation icon. | The field's placeholder names it; the launcher has no navigation title bar. | — |
 | `builtins/vicinae` | Where the platform cannot paste, the picker offers no paste action and `defaultAction` defaults to copy. | The window cannot know before asking, so paste is offered whenever an engine is attached, and a refusal copies; the result is the same glyph on the clipboard. | `the_picker_pastes_the_glyph_and_copies_where_the_engine_cannot` |
 | `builtins/vicinae` | The paste action is titled `Paste to <frontmost app>` with its icon. | `Paste to active window`, the C++'s title when no application is frontmost. | `the_picker_pastes_the_glyph_and_copies_where_the_engine_cannot` |
+| `ui/action-panel` | Action titles mix sentence case ("Reset ranking", "Add to favorites", "Disable item") and title case ("Copy Deeplink", "Set Global Shortcut", "Quit Application"); shortcut badges show the binding as stored (`ctrl+shift+c`). | Sentence case throughout, the case most of upstream's v0.29.0 action titles use (42 of 74 multi-word titles); acronyms and names keep their capitals ("Copy ID", "Open in Ptyxis"). Badges read `Ctrl+Shift+C`, `Enter` (`key_combo::badge`). The root search's status bar shows the primary action and "Actions Ctrl+B" beside the clock, as dmenu's does. | `a_badge_reads_the_same_whatever_the_spelling`, `the_root_footer_names_enter_and_the_action_panel` |
 | `ui/action-panel` | Set Global Shortcut is offered only where `platform::supports(GlobalShortcuts)`. | Always offered: the shortcut is kept in the configuration either way, and the engine binds it where it has a backend ("The gaps pass, global shortcuts"). | `the_root_panel_records_an_items_shortcut_and_backspace_removes_it` |
 | `ui/action-panel` | The capture suspends the global shortcuts and inhibits the compositor's while it records. | Both: the global shortcuts are suspended (IPC v20 `ShortcutCapture`, "The gaps pass, global shortcuts") and the compositor's inhibited under the layer-shell presentation ("The gaps pass, wlroots paste and inhibit"); under `xdg_toplevel` the compositor's are not inhibited. | `the_recorder_suspends_the_global_shortcuts_while_it_captures`, `the_root_panel_records_an_items_shortcut_and_backspace_removes_it` |
 | `ui/action-panel` | "Already bound" also checks the launcher's own keybinds (`KeybindManager`). | Checked, as far as Compass has them: its keys are fixed (Toggle action panel, Open settings, Quick launch), and the launcher hotkey with them. | `the_recorder_refuses_the_launchers_own_keys`, `the_launchers_own_keys_and_its_hotkey_are_taken` |
@@ -663,6 +664,10 @@ first under the C++'s `live_calc` gate and offers the C++ panel (pin or unpin, c
 or both, delete, delete all). Declared differences: a row's conversion flag comes from the question's
 `to`/`in`/`as`/`->` keyword, since fend reports no answer type; "Delete all entries" deletes, where
 the C++ action's `execute` is empty; pinning and removing say so in the view rather than a toast.
+The answer in root search offers v0.29.0's `RootCalculatorSection::actionPanel` (Copy Result, Copy
+Question And Answer, Put answer in search bar, Open Calculator History;
+`compass_core::calculator_history::live_action_panel`), without "Copy unformatted answer", which the
+C++ adds only when its backend returns a second, unformatted form: fend prints only one.
 Copying shows the C++'s HUD ("Answer copied to clipboard", "Copied to clipboard"; see "The gaps pass,
 HUD and onboarding").
 Currency conversion and Refresh Exchange Rates stay unported, blocked on a rate source.
@@ -870,13 +875,17 @@ Declared differences:
 - **The C++ settings Compass has no reader for are not offered**, each listed with its reason at
   the foot of its page (`settings_catalog::NOT_IN_COMPASS`), rather than written to a file that
   would then look as though it honoured them (the rule `config_migration` follows): Close on
-  Escape, Pop to root on close, Language, usage statistics, Font size, Icon Theme, Window material
+  Escape, Language, usage statistics, Font size, Icon Theme, Window material
   and opacity, Compact mode, Floating status bar, layer shell, client-side decorations and their
   rounding, border and shadow, native font rendering, Pop on backspace, Activate on single click,
   IME handling, Root file search, Favicon fetching, Encrypt sensitive data, and
   rebinding the launcher's keys (the Keybindings page lists the fixed ones).
 - **Settings only Compass has are offered beside them**: quick launch, the result count, the clock,
   the colour scheme, the layout preset, application icons and translucency.
+- **Clear the search on close** (`launcher.pop_to_root_on_close`, Vicinae's `pop_to_root_on_close`,
+  off by default as in v0.29.0) clears the search text when the launcher hides. A view opened from
+  the search closes on hide whatever it says; in Vicinae, with the setting off, the view stays open
+  for the next summon.
 - The launcher hotkey and Close on focus loss are written to `launcher.hotkey` and
   `launcher.close_on_focus_loss`, the schema's keys; the engine binds the hotkey from the file and
   rebinds it when it changes, and the window hides on focus loss when the switch is on ("The gaps
@@ -990,8 +999,12 @@ Declared differences:
 - The surface is a fixed 336×48 with the pill centred in it, rather than sized to the pill: a layer
   surface's size is asked for before anything is laid out, and the rest of it is transparent and
   takes no input.
-- An extension's `showHUD` is still a desktop notification: the extension host runs outside the
-  window's reach (`HeadlessShell`), and the launcher has hidden by then.
+- A no-view extension's `showHUD` goes to the launcher's HUD (`HeadlessShell` is handed the
+  launcher window), falling back to a desktop notification where there is no HUD. Its failure
+  toasts and its crash go to the launcher as `WindowCommand::Failure` (IPC v23): the reason in the
+  HUD now and the launcher's error line when it is next shown, since the launcher has hidden by
+  then and a desktop notification is lost where no notification daemon runs. The notification is
+  still posted too, and outlasts the HUD.
 - Where there is no HUD, the engine's HUDs become a transient notification rather than nothing.
 - Set Default Terminal's HUD has no icon (the C++'s is a green `$` symbol, which the builtin set does
   not have).
@@ -1003,30 +1016,43 @@ cannot be read, and finishing writes `{"version":1,"completedAt":"…"}` there, 
 so a person who finished it under either engine is not asked again. The steps are the QML's on
 Linux: "Welcome to Vicinae", "Make it your own" (the theme, kept as Set Theme keeps it, and the
 global hotkey row) and "Setup complete" (GitHub and Sponsor), with Back, the step dots (a click
-jumps), Continue and Finish; Enter continues and Escape closes without recording, so the next start
-asks again. `compass` passes the state file to the window when the flow is due
-(`AppFlags::onboarding`), and the window opens on it at start even when started hidden, as the C++
-shows its window at server start. `COMPASS_NO_ONBOARDING` is the C++'s `ENABLE_ONBOARDING=OFF`, and
-the VM tier, the sway harness and the session bench set it.
+jumps), Continue and Finish; Enter continues. **Difference:** Escape goes back a step and closes
+only from the first, and Tab and Shift+Tab walk each step's controls (the theme dropdown, Open Docs,
+each Install, GitHub, Back, Continue) with Space or Enter to press, as in Settings; the QML flow is
+mouse-first. `compass` passes the state file to the window when the flow is due
+(`AppFlags::onboarding`). `COMPASS_NO_ONBOARDING` is the C++'s `ENABLE_ONBOARDING=OFF`, and the VM
+tier, the sway harness and the session bench set it.
 
 | Row | Flipped | Rust | Tests that would fail on a regression |
 |---|---|---|---|
-| `ui/qml`, `ui/quick`, `ui/windows` | — (onboarding is closed; the settings window keeps each amber) | `compass_core::onboarding` (`should_show`, `mark_completed`, `Flow`), `compass_ui::onboarding_page`, `compass_ui::app::onboarding`, `compass::onboarding_due` | `it_is_due_until_the_current_version_is_recorded`, `the_cpps_own_file_is_read`, `linux_has_four_steps_and_continue_finishes_on_the_last`, `the_recommendations_are_installable_store_extensions`, `suite_1_shows_every_recommendation_rendering`, `an_unreachable_store_is_reported_and_can_be_retried`, `every_onboarding_button_does_what_it_says`, `every_onboarding_step_paints_its_heading_and_buttons` (paint), `the_permissions_step_is_macos_only`, `the_switch_reads_like_a_boolean_environment_variable`, `a_due_onboarding_opens_the_window_even_when_started_hidden`, `finishing_the_onboarding_records_it_and_hides`, `escape_closes_the_onboarding_without_recording_it`, `every_onboarding_step_draws_its_heading_and_buttons` |
+| `ui/qml`, `ui/quick`, `ui/windows` | — (onboarding is closed; the settings window keeps each amber) | `compass_core::onboarding` (`should_show`, `mark_completed`, `came_from_vicinae`, `Flow`), `compass_ui::onboarding_page`, `compass_ui::app::onboarding`, `compass::onboarding_due` | `it_is_due_until_the_current_version_is_recorded`, `the_cpps_own_file_is_read`, `linux_has_four_steps_and_continue_finishes_on_the_last`, `the_recommendations_are_installable_store_extensions`, `suite_1_shows_every_recommendation_rendering`, `an_unreachable_store_is_reported_and_can_be_retried`, `every_onboarding_button_does_what_it_says`, `every_onboarding_step_paints_its_heading_and_buttons` (paint), `the_permissions_step_is_macos_only`, `the_switch_reads_like_a_boolean_environment_variable`, `a_due_onboarding_started_hidden_waits_for_the_first_summon`, `finishing_the_onboarding_records_it_and_hides`, `escape_closes_the_onboarding_and_records_it_as_seen`, `a_home_carried_over_from_vicinae_is_recognised`, `every_onboarding_step_draws_its_heading_and_buttons` |
 
 Declared differences:
 
+- **Started hidden, the flow waits for the first summon.** The C++ opens its window at server start;
+  `compass start --hidden` runs at login, where a window nobody asked for is in the way.
+- **Closing the flow counts as having seen it.** The C++ records only Finish, so closing its window
+  shows the flow again at every start; here Escape or the hotkey record it too. Finish leaves the
+  launcher open at its search rather than hiding.
+- **A home carried over from Vicinae skips the flow**: its `vicinae` directory (or the symlink the
+  move leaves) or Vicinae's `settings.json` means the launcher is already set up.
 - The flow is drawn in the launcher's card rather than a 700×480 window of its own: the launcher has
-  one surface, and a second toplevel would be a second window for the compositor to place. Finishing
-  hides the card, as finishing hides the C++'s window.
-- The global hotkey row takes the C++'s branch for a platform without global shortcuts ("Bind a key
-  to "compass toggle"" and Open Docs): the window cannot know whether the engine found a backend,
-  and the hotkey is changed from Settings, General (`launcher.hotkey`, bound as it changes since
-  "The gaps pass, global shortcuts"). The last step's sentence follows.
+  one surface, and a second toplevel would be a second window for the compositor to place.
+- The global hotkey row and the last step say how to open the launcher on this desktop: on Sway,
+  Hyprland and niri the line for the compositor's configuration, elsewhere the hotkey with
+  `compass toggle` as the fallback, and inside the Flatpak `flatpak run org.tunaos.compass toggle`
+  (`compass_core::hotkey_guide`).
 - The macOS permissions step and Launch at login are not offered, as on the C++'s Linux build.
 - An "Add extensions" step before the last recommends `compass_core::onboarding::RECOMMENDED_EXTENSIONS`
   (store extensions Suite 1 shows rendering) with an Install button each, through the store's own
   `store_install`. The C++ flow never mentions extensions (#250). A failed install, offline
-  included, says why and leaves Continue working.
+  included, says why and leaves Continue working. Four come from the Raycast store (Google
+  Translate, Google Search, GIF Search, Tailwind CSS: no account, no API key, no AppleScript) and
+  three from Vicinae's, each labelled with its store.
+- The step's buttons are Adwaita's (`compass_ui::adwaita`): Continue and Finish the suggested
+  action, the rest flat and neutral, Installed and Installing… bare. A link button says on the card
+  that it opened ("Opened in browser") or why not, where the C++ calls `Qt.openUrlExternally` and
+  says nothing.
 - Open Docs goes to Compass's guide (`docs/getting-started.md`, "Set a keyboard shortcut", on
   tunaos.org) rather than Vicinae's FAQ, and the last step names Compass and links tuna-os/compass
   with no Sponsor button: Compass has no sponsor page, and asking a new user to fund another project
@@ -1221,6 +1247,26 @@ item's shortcut by its title, or "another command").
 **Close on focus loss** (`setWindowActivated`). With `launcher.close_on_focus_loss` on, the window
 hides when it loses a focus it had, and not when the focus goes to the file chooser it opened
 (`m_pendingLauncherFileChoice`); the settings view's switch applies at once.
+
+Differences on the layer-shell presentation and after (2026-10-01, the robustness pass):
+
+- **A click outside a layer-shell launcher hides it.** A layer surface that holds the keyboard
+  exclusively never loses the focus, so the C++ falls back to a pointer that leaves the window
+  ("only works on some compositors", `LauncherWindow::eventFilter`), and on Sway a click on
+  another window went through and left the launcher up (TIL-03). With the option on, Compass puts
+  a transparent layer surface under the launcher (`surface::open_backdrop`), whose input region
+  leaves the launcher out, and a click on it hides the launcher. It is the "layer behind ours"
+  the C++ comment suggests.
+- **`toggle` brings back a toplevel left behind another window** rather than hiding it, as a new
+  window, which the compositor focuses as it does every summon; raising the old one is refused
+  without an activation token. The C++ hides it. A launcher that has never reported the focus (a
+  seat with no keyboard) still toggles closed.
+- **The window fits small and scaled outputs** (TIL-04): the layer surface first opens at the
+  output's full size to learn the room, then takes the launcher's size fitted to it; a toplevel
+  is fitted to its monitor once mapped, and opens fitted after that. The C++ sizes its window
+  from the config and lets an oversized one be cut off.
+- **`compass start` runs the window as a child and starts it again when it fails**, keeping the
+  engine; five failures in a minute end it. The C++ runs one process.
 
 | Row | Flipped | Rust | Tests that would fail on a regression |
 |---|---|---|---|
@@ -3532,6 +3578,7 @@ visits. What differs:
 | 8 | Root rows weigh shortcuts at `baseScoreWeight` 1.4, and a shortcut with one argument can be a fallback command that opens with the search text; its fallback panel adds Manage Fallback Actions. | Ranked like every other root item. A `shortcuts:<id>` entry in `fallbacks` whose link takes one argument is a fallback row, in the configured order, opening with the query; its panel is Open and Manage Fallback Actions, which opens Configure Fallback Commands. | `a_one_argument_shortcut_named_as_a_fallback_opens_with_the_query`, `configure_fallback_commands_moves_items_between_its_sections` |
 | 9 | The migration from the pre-JSON SQLite `shortcut` table. | Not run: the one-shot import is from Vicinae's JSON file, which already holds a migrated list. | — |
 | 10 | A removal toast ("Removed link") and success toasts after saving. | The list updates in place; failures show in the view. | `manage_shortcuts_filters_edits_and_removes` |
+| 11 | Arguments, `{clipboard}` and `{selection}` go into the link as typed, so `?q={query}` with `a & b` ends the query at the `&`. | In a URL template (a scheme and `://` before any placeholder, not `file:`) each value is percent-encoded, all but RFC 3986's unreserved characters and `/`; a link that is all placeholder, a path or a command line is filled in as typed. | `values_in_a_url_template_are_percent_encoded_and_elsewhere_left_alone` |
 
 ### Snippets — what the port does not have yet
 
@@ -3735,7 +3782,8 @@ root search forgets it. What differs:
 | 10 | The list is fetched with `PreferCache` and reused while Qt's disk cache keeps it. | The Vicinae list is kept in memory for ten minutes; the Raycast pages for the session, as the C++. | — |
 | 11 | The Raycast API is always `backend.raycast.com`. | `COMPASS_RAYCAST_API_URL` overrides it, as `COMPASS_API_URL` already overrides the Vicinae API, so tests serve both stores locally. | `raycast_store::api_base_url` |
 | 12 | Only the store builtins' links open (`openTarget`). | `OpenUrl` opens any `http(s)` link with the default browser (anything else is refused), and the launcher now uses it for links clicked in Markdown, including an extension view's, which were only logged before. | `only_web_urls_are_opened` |
-| 13 | Deep links (`vicinae://extensions/<author>/<name>` into a detail host; `raycast://` and `com.raycast:` into the Raycast store's) exist, and a link with the wrong number of segments answers the usage sentence. | The same: `compass deeplink <url>` (or a bare `compass <url>`) sends IPC v16 `OpenDeeplink`, the engine pushes `WindowCommand::Deeplink` to the window, which opens the detail page; Escape goes to that store's list rather than the root. | `an_extensions_link_names_the_store_author_and_extension`, `an_extensions_deeplink_goes_to_the_window_and_a_malformed_one_is_refused`, `a_deeplink_opens_the_detail_page_and_uninstalling_asks_in_a_dialog` |
+| 13 | Deep links (`vicinae://extensions/<author>/<name>` into a detail host; `raycast://` and `com.raycast:` into the Raycast store's) exist, and a link with the wrong number of segments answers the usage sentence. | The same: `compass deeplink <url>` (or a bare `compass <url>`) sends IPC v16 `OpenDeeplink`, the engine pushes `WindowCommand::Deeplink` to the window, which opens the detail page; Escape goes to that store's list rather than the root. A third segment, Raycast's `raycast://extensions/<owner>/<name>/<command>` (what `createDeeplink` makes), runs the installed command it names, found by owner or author, and opens the store page when it is not installed. | `an_extensions_link_names_the_store_owner_and_extension`, `a_command_link_finds_the_installed_command_by_owner_or_author`, `an_extensions_deeplink_goes_to_the_window_and_a_malformed_one_is_refused`, `a_deeplink_opens_the_detail_page_and_uninstalling_asks_in_a_dialog` |
+| 14 | A Raycast extension's detail and install URLs are built from `author.handle`, so an organisation's extension (GitHub, Linear and Todoist are filed under `raycast`, `linear` and `doist`) is a 404 and cannot be opened or installed. | They are built from the listing's `owner.handle`, falling back to the author's; the row carries both (IPC v23 `StoreEntry.owner`) and shows the author. The installed id (`store.raycast.<name>`) has no handle in it, so existing installs are unchanged. The runtime's `ownerOrAuthorName` is the manifest's `owner` when it has one, as Raycast's is. | `an_organisations_extension_is_addressed_by_its_owner_not_its_author`, `an_organisations_raycast_extension_opens_and_installs_by_its_owner` |
 
 ### `compass-crypto` — one error variant the C++ API cannot express
 

@@ -1,22 +1,30 @@
 //! The first-run flow in the launcher: `OnboardingWindow.qml`'s Linux steps
 //! (welcome, "Make it your own", "Setup complete") with Back, Continue and the
-//! step dots, Enter to continue and Escape to close, and Compass's own "Add
+//! step dots, Enter to continue and Escape to go back (closing from the
+//! first step), Tab through each step's controls, and Compass's own "Add
 //! extensions" step before the last, which installs through the same backend
 //! call as the store's detail page.
 //!
-//! Finishing records the flow in `onboarding.json` and hides, as
-//! `OnboardingWindow::finish`; closing does not record it, so the next start
-//! shows it again, as closing the C++'s window does.
+//! Finishing records the flow in `onboarding.json` and leaves the launcher
+//! open at its search. Closing it, with Escape or the hotkey, records it too:
+//! unlike Vicinae, which asks again at the next start, Compass does not show
+//! it at every login to someone who has already dismissed it. Started with
+//! `--hidden`, the flow waits for the first summon.
 
-use iced::keyboard::{Key, key::Named};
+use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{Space, button, column, container, pick_list, row, text};
 use iced::{Alignment, Border, Element, Length, Padding, Theme};
 
 use super::{LauncherApp, Message, Page, Task};
-use crate::onboarding_page::{OnboardingPage, ThemeOption};
+use crate::adwaita;
+use crate::onboarding_page::{Control, OnboardingPage, ThemeOption};
 use compass_core::onboarding::{self, Advance, Step};
 
 const COMPASS_LOGO: &[u8] = include_bytes!("../../../../extra/compass.svg");
+
+/// A recommendation's button: shorter than Adwaita's 34 px, so the whole
+/// list fits the card with room for a failure's notice under it.
+const INSTALL_PADDING: [f32; 2] = [5.0, 12.0];
 
 /// Whether the platform binds the launcher's hotkey itself
 /// (`Platform.supports("globalShortcuts")`). Compass binds only its fixed
@@ -24,10 +32,46 @@ const COMPASS_LOGO: &[u8] = include_bytes!("../../../../extra/compass.svg");
 /// takes the C++'s other branch: bind a key to `compass toggle`.
 const SHORTCUTS_AVAILABLE: bool = false;
 
+/// How tall the theme list opened from the keyboard grows before it
+/// scrolls: five themes.
+const MENU_HEIGHT: f32 = 160.0;
+
 /// Why Install did nothing, as the store pages say it.
 const NEEDS_ENGINE: &str = "Installing extensions needs the Compass engine";
 
+/// Why a link did not open, as `open_link` says it.
+const OPEN_NEEDS_ENGINE: &str = "Opening a link needs the Compass engine";
+
+/// Records the flow as seen, now. A file that cannot be written is logged:
+/// the cost is seeing the flow again, not losing anything.
+pub(super) fn record_completed(path: &std::path::Path) {
+    let completed_at = jiff::Timestamp::now()
+        .round(jiff::Unit::Second)
+        .unwrap_or_else(|_| jiff::Timestamp::now())
+        .to_string();
+    if let Err(error) = onboarding::mark_completed(path, &completed_at) {
+        tracing::warn!(%error, path = %path.display(), "could not write the onboarding state file");
+    }
+}
+
 impl LauncherApp {
+    /// How to open the launcher from anywhere on this desktop: the
+    /// compositor's own line on Sway, Hyprland and niri, the hotkey
+    /// elsewhere, and in the Flatpak the command the Flatpak needs.
+    pub(super) fn open_hint(&self) -> String {
+        let command = compass_core::hotkey_guide::toggle_command(self.flatpak);
+        if let Some(compositor) = self.hotkey_compositor {
+            return compositor.instruction(&command);
+        }
+        let key = compass_core::key_combo::KeyCombo::parse(&self.launcher_hotkey).map_or_else(
+            || self.launcher_hotkey.clone(),
+            |combo| combo.display_tokens().join("+"),
+        );
+        format!(
+            "Press {key} to open Compass from anywhere. If it does nothing, bind a key to `{command}` in your desktop's keyboard settings."
+        )
+    }
+
     /// Opens the flow at its first step, recording to `state_path`.
     pub fn open_onboarding(&mut self, state_path: std::path::PathBuf) {
         let files = crate::theme::load_user_themes(&self.theme_dirs);
@@ -52,11 +96,82 @@ impl LauncherApp {
         }
     }
 
-    /// The flow's keys: Enter continues, Escape closes it.
-    pub(super) fn onboarding_key(&mut self, key: &Key) -> Task<Message> {
+    /// What the extensions step's last failed install said, while the flow
+    /// is on screen. For tests.
+    #[must_use]
+    pub fn onboarding_install_notice(&self) -> Option<&str> {
+        match &self.page {
+            Page::Onboarding(page) => page.extensions.notice(),
+            _ => None,
+        }
+    }
+
+    /// The flow's keys, as Settings has them: Tab and Shift+Tab walk the
+    /// step's controls, then Back and Continue; Space or Enter presses the
+    /// one with the keyboard or opens the theme dropdown, whose themes the
+    /// arrows then move through. With no control focused Enter continues.
+    /// Escape closes the dropdown, else goes back a step, and closes the
+    /// flow only from its first step.
+    pub(super) fn onboarding_key(&mut self, key: &Key, modifiers: Modifiers) -> Task<Message> {
+        let Page::Onboarding(page) = &mut self.page else {
+            return Task::none();
+        };
+        let activate = matches!(key.as_ref(), Key::Named(Named::Enter | Named::Space));
+        if let Some(at) = page.menu {
+            return match key.as_ref() {
+                Key::Named(Named::ArrowDown) => {
+                    page.menu = Some(crate::focus::move_highlight(page.themes.len(), at, 1));
+                    crate::scroll::reveal_onboarding_option()
+                }
+                Key::Named(Named::ArrowUp) => {
+                    page.menu = Some(crate::focus::move_highlight(page.themes.len(), at, -1));
+                    crate::scroll::reveal_onboarding_option()
+                }
+                Key::Named(Named::Escape) => {
+                    page.menu = None;
+                    Task::none()
+                }
+                _ if activate => match page.themes.get(at).copied() {
+                    Some(theme) => self.update(Message::OnboardingTheme(theme)),
+                    None => Task::none(),
+                },
+                _ => Task::none(),
+            };
+        }
         match key.as_ref() {
-            Key::Named(Named::Enter) => self.update(Message::OnboardingContinue),
+            Key::Named(Named::Tab) => {
+                page.move_focus(!modifiers.shift());
+                Task::none()
+            }
+            Key::Named(Named::Escape) if page.flow.can_go_back() => {
+                self.update(Message::OnboardingBack)
+            }
             Key::Named(Named::Escape) => self.conceal(),
+            _ if activate => match page.focused {
+                Some(Control::Theme) => {
+                    let current = ThemeOption(self.theme_choice);
+                    page.menu = Some(
+                        page.themes
+                            .iter()
+                            .position(|theme| *theme == current)
+                            .unwrap_or(0),
+                    );
+                    Task::none()
+                }
+                Some(Control::OpenDocs) => {
+                    self.update(Message::OnboardingOpen(onboarding::HOTKEY_DOCS_URL))
+                }
+                Some(Control::GitHub) => {
+                    self.update(Message::OnboardingOpen(onboarding::GITHUB_URL))
+                }
+                Some(Control::Install(index)) => self.update(Message::OnboardingInstall(index)),
+                Some(Control::Back) => self.update(Message::OnboardingBack),
+                Some(Control::Continue) => self.update(Message::OnboardingContinue),
+                None if key.as_ref() == Key::Named(Named::Enter) => {
+                    self.update(Message::OnboardingContinue)
+                }
+                None => Task::none(),
+            },
             _ => Task::none(),
         }
     }
@@ -66,32 +181,40 @@ impl LauncherApp {
         let Page::Onboarding(page) = &mut self.page else {
             return Task::none();
         };
+        if matches!(
+            message,
+            Message::OnboardingContinue | Message::OnboardingBack | Message::OnboardingJump(_)
+        ) {
+            page.step_changed();
+        }
         match message {
             Message::OnboardingContinue => match page.flow.advance() {
-                Advance::Next => Task::none(),
+                Advance::Next => {
+                    // What a step said belongs to that step.
+                    page.notice = None;
+                    Task::none()
+                }
                 Advance::Finish => {
-                    let completed_at = jiff::Timestamp::now()
-                        .round(jiff::Unit::Second)
-                        .unwrap_or_else(|_| jiff::Timestamp::now())
-                        .to_string();
-                    if let Err(error) = onboarding::mark_completed(&page.state_path, &completed_at)
-                    {
-                        tracing::warn!(%error, path = %page.state_path.display(),
-                            "could not write the onboarding state file");
-                    }
-                    self.conceal()
+                    // Finish leaves the launcher open at its search, so the
+                    // first thing after setting it up is using it.
+                    record_completed(&page.state_path);
+                    self.page = Page::Root;
+                    super::focus_search()
                 }
             },
             Message::OnboardingBack => {
+                page.notice = None;
                 page.flow.back();
                 Task::none()
             }
             Message::OnboardingJump(position) => {
+                page.notice = None;
                 page.flow.jump(position);
                 Task::none()
             }
             Message::OnboardingTheme(ThemeOption(theme)) => {
                 page.notice = None;
+                page.menu = None;
                 let preview = self.update(Message::ThemePreview(theme));
                 let Some(backend) = self.backend.clone() else {
                     return preview;
@@ -106,16 +229,24 @@ impl LauncherApp {
                 ])
             }
             Message::OnboardingOpen(url) => {
+                // As `open_link` everywhere else: through the engine, which
+                // starts the default browser, or a reason why not. The flow
+                // stays up, so what happened is said on the card.
                 let Some(backend) = self.backend.clone() else {
+                    page.notice = Some(OPEN_NEEDS_ENGINE.to_owned());
                     return Task::none();
                 };
+                page.notice = None;
                 Task::perform(
                     async move { backend.open_url(url.to_owned()).await },
                     Message::OnboardingLinkOpened,
                 )
             }
-            Message::OnboardingLinkOpened(Err(reason)) => {
-                page.notice = Some(reason);
+            Message::OnboardingLinkOpened(result) => {
+                page.notice = Some(match result {
+                    Ok(()) => super::compass_commands::OPENED_IN_BROWSER.to_owned(),
+                    Err(reason) => reason,
+                });
                 Task::none()
             }
             Message::OnboardingInstall(index) => {
@@ -127,21 +258,23 @@ impl LauncherApp {
                         .finished(index, Err(NEEDS_ENGINE.to_owned()));
                     return Task::none();
                 };
-                let (store, author, name) = (
+                let (store, owner, name) = (
                     recommendation.store,
-                    recommendation.author.to_owned(),
+                    recommendation.owner.to_owned(),
                     recommendation.name.to_owned(),
                 );
                 Task::perform(
-                    async move { backend.store_install(store, author, name).await },
+                    async move { backend.store_install(store, owner, name).await },
                     move |result| Message::OnboardingInstalled(index, result),
                 )
             }
             Message::OnboardingInstalled(index, result) => {
-                let installed = result.is_ok();
+                let installed = result.as_ref().ok().map(|(id, _)| id.clone());
                 page.extensions.finished(index, result.map(|_| ()));
-                if installed {
-                    self.app_index.rescan_extensions();
+                // What the store's detail page does with an install: the
+                // stores and root search learn of it.
+                if let Some(id) = installed {
+                    self.store_changed(&id, true);
                 }
                 Task::none()
             }
@@ -149,21 +282,28 @@ impl LauncherApp {
         }
     }
 
-    /// A step's bordered box of rows.
+    /// A step's box of rows: an Adwaita boxed list.
     fn onboarding_box<'a>(&self, rows: Element<'a, Message>) -> Element<'a, Message> {
-        let border = self.palette().border.to_iced();
+        let palette = self.palette();
         container(rows)
-            .padding(14)
+            .padding(Padding::new(10.0).left(14).right(14))
             .width(Length::Fixed(480.0))
-            .style(move |_: &Theme| container::Style {
-                border: Border {
-                    color: border,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                ..container::Style::default()
-            })
+            .style(move |_: &Theme| adwaita::boxed_list(palette))
             .into()
+    }
+
+    /// Where a recommendation comes from, as a small pill after its title.
+    fn store_badge<'a>(&self, store: compass_core::store_listing::Store) -> Element<'a, Message> {
+        let palette = self.palette();
+        container(
+            text(store.name())
+                .font(self.font())
+                .size(11)
+                .color(palette.muted.to_iced()),
+        )
+        .padding(Padding::new(1.0).left(6).right(6))
+        .style(move |_: &Theme| adwaita::badge(palette))
+        .into()
     }
 
     /// The flow's card: the step, then Back, the dots and Continue.
@@ -188,10 +328,28 @@ impl LauncherApp {
                 .size(12)
                 .color(palette.muted.to_iced())
         };
+        // Adwaita's buttons: the one the step asks for in the accent, the
+        // rest flat and neutral.
         let action = |label: &'a str, message: Message| {
             button(text(label).font(self.font()).size(13))
                 .on_press(message)
-                .padding(Padding::new(6.0).left(14).right(14))
+                .padding(adwaita::CONTROL_PADDING)
+                .style(move |_: &Theme, status| adwaita::button(palette, status))
+        };
+        let suggested = |label: &'a str, message: Message| {
+            button(text(label).font(self.font()).size(13))
+                .on_press(message)
+                .padding(adwaita::CONTROL_PADDING)
+                .style(move |_: &Theme, status| adwaita::suggested_button(palette, status))
+        };
+        let ring = |control: Control, element: Element<'a, Message>| -> Element<'a, Message> {
+            adwaita::ringed(
+                element,
+                palette,
+                page.focused == Some(control),
+                adwaita::CONTROL_RADIUS,
+            )
+            .into()
         };
 
         let mut content = column![].spacing(8).align_x(Alignment::Center);
@@ -211,24 +369,67 @@ impl LauncherApp {
                         small("Shared across the entire app."),
                     ]
                     .width(Length::Fill),
-                    pick_list(
-                        page.themes.as_slice(),
-                        Some(current),
-                        Message::OnboardingTheme
-                    )
-                    .text_size(13)
-                    .width(Length::Fixed(200.0)),
+                    ring(
+                        Control::Theme,
+                        pick_list(
+                            page.themes.as_slice(),
+                            Some(current),
+                            Message::OnboardingTheme
+                        )
+                        .text_size(13)
+                        .font(self.font())
+                        .padding(adwaita::CONTROL_PADDING)
+                        .style(move |_: &Theme, status| adwaita::dropdown(palette, status))
+                        .menu_style(move |_: &Theme| crate::design::dropdown_menu(palette))
+                        .width(Length::Fixed(200.0))
+                        .into()
+                    ),
                 ]
                 .align_y(Alignment::Center);
+                let theme_row: Element<'a, Message> = match page.menu {
+                    Some(highlighted) => {
+                        let options = page
+                            .themes
+                            .iter()
+                            .map(|theme| {
+                                (
+                                    theme.to_string(),
+                                    *theme == current,
+                                    Message::OnboardingTheme(*theme),
+                                )
+                            })
+                            .collect();
+                        column![
+                            theme_row,
+                            // A list of every theme file would push the
+                            // step off the card: it scrolls past a few.
+                            container(
+                                crate::scroll::scrollable(self.choice_menu(options, highlighted))
+                                    .id(crate::scroll::ONBOARDING_MENU)
+                            )
+                            .max_height(MENU_HEIGHT)
+                            .padding(Padding::new(4.0).left(220))
+                        ]
+                        .into()
+                    }
+                    None => theme_row.into(),
+                };
                 let hotkey_row = row![
                     column![
                         text("Global hotkey").font(self.font()).size(14),
-                        small("Bind a key to \"compass toggle\""),
+                        text(self.open_hint())
+                            .font(self.font())
+                            .size(12)
+                            .color(palette.muted.to_iced()),
                     ]
                     .width(Length::Fill),
-                    action(
-                        "Open Docs",
-                        Message::OnboardingOpen(onboarding::HOTKEY_DOCS_URL)
+                    ring(
+                        Control::OpenDocs,
+                        action(
+                            "Open Docs",
+                            Message::OnboardingOpen(onboarding::HOTKEY_DOCS_URL)
+                        )
+                        .into()
                     ),
                 ]
                 .align_y(Alignment::Center);
@@ -236,28 +437,42 @@ impl LauncherApp {
                     .push(self.onboarding_box(column![theme_row, hotkey_row].spacing(14).into()));
             }
             Step::Extensions => {
-                let mut rows = column![].spacing(6);
+                let mut rows = column![].spacing(4);
                 for (index, recommendation) in onboarding::RECOMMENDED_EXTENSIONS.iter().enumerate()
                 {
                     let state = page
                         .extensions
                         .state(index)
                         .unwrap_or(onboarding::Install::Available);
+                    // Install and Try Again are neutral, as every row has one;
+                    // Installing and Installed are flat, with nothing to press.
                     let install = button(text(state.label()).font(self.font()).size(13))
                         .on_press_maybe(
                             state
                                 .can_install()
                                 .then_some(Message::OnboardingInstall(index)),
                         )
-                        .padding(Padding::new(6.0).left(14).right(14));
+                        .padding(INSTALL_PADDING)
+                        .style(move |_: &Theme, status| {
+                            if state.can_install() {
+                                adwaita::button(palette, status)
+                            } else {
+                                adwaita::flat_button(palette, status)
+                            }
+                        });
                     rows = rows.push(
                         row![
                             column![
-                                text(recommendation.title).font(self.font()).size(14),
+                                row![
+                                    text(recommendation.title).font(self.font()).size(14),
+                                    self.store_badge(recommendation.store),
+                                ]
+                                .spacing(6)
+                                .align_y(Alignment::Center),
                                 small(recommendation.description),
                             ]
                             .width(Length::Fill),
-                            install,
+                            ring(Control::Install(index), install.into()),
                         ]
                         .align_y(Alignment::Center),
                     );
@@ -276,12 +491,23 @@ impl LauncherApp {
             }
             Step::Complete => {
                 content = content
+                    .push(
+                        container(
+                            text(self.open_hint())
+                                .font(self.font())
+                                .size(13)
+                                .color(palette.text.to_iced())
+                                .align_x(Alignment::Center),
+                        )
+                        .max_width(480.0),
+                    )
                     .push(Space::new().height(16))
                     .push(small("Compass is open source software."))
                     .push(
-                        row![action(
-                            "GitHub",
-                            Message::OnboardingOpen(onboarding::GITHUB_URL)
+                        row![ring(
+                            Control::GitHub,
+                            action("GitHub", Message::OnboardingOpen(onboarding::GITHUB_URL))
+                                .into()
                         )]
                         .spacing(8),
                     );
@@ -292,11 +518,10 @@ impl LauncherApp {
             content = content.push(self.notice(notice));
         }
 
+        // The step that is not this one in the control colour, 3:1 on the
+        // card, rather than a faint text colour nobody can count.
         let accent = palette.accent.to_iced();
-        let dim = iced::Color {
-            a: 0.2,
-            ..palette.text.to_iced()
-        };
+        let dim = palette.control().to_iced();
         let mut dots = row![].spacing(7);
         for position in 0..page.flow.count() {
             let color = if position == page.flow.position() {
@@ -319,16 +544,19 @@ impl LauncherApp {
             );
         }
         let back: Element<'a, Message> = if page.flow.can_go_back() {
-            action("Back", Message::OnboardingBack).into()
+            ring(
+                Control::Back,
+                action("Back", Message::OnboardingBack).into(),
+            )
         } else {
             Space::new().into()
         };
         let footer = row![
             container(back).width(Length::Fill),
             dots,
-            container(action(
-                page.flow.primary_label(),
-                Message::OnboardingContinue
+            container(ring(
+                Control::Continue,
+                suggested(page.flow.primary_label(), Message::OnboardingContinue).into()
             ))
             .width(Length::Fill)
             .align_x(Alignment::End),
